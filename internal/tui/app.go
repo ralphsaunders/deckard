@@ -12,6 +12,7 @@ import (
 
 	"deckard/internal/git"
 	"deckard/internal/model"
+	"deckard/internal/tmux"
 )
 
 // — state ———————————————————————————————————————————————————————————————————
@@ -60,6 +61,11 @@ type worktreeCreatedMsg struct {
 	err  error
 }
 
+type sessionEnsuredMsg struct {
+	slug string
+	err  error
+}
+
 type claudeExitedMsg struct {
 	err error
 }
@@ -75,10 +81,14 @@ type sessionItem struct {
 }
 
 func (i sessionItem) Title() string {
+	prefix := ""
 	if i.s.NeedsInput {
-		return "* " + i.s.Slug
+		prefix = "* "
 	}
-	return i.s.Slug
+	if i.s.TmuxRunning {
+		return prefix + i.s.Slug + " ●"
+	}
+	return prefix + i.s.Slug
 }
 
 func (i sessionItem) Description() string { return i.s.Branch }
@@ -128,7 +138,13 @@ func New() Model {
 
 func fetchSessions() tea.Msg {
 	sessions, err := git.ListWorktrees()
-	return sessionsLoadedMsg{sessions: sessions, err: err}
+	if err != nil {
+		return sessionsLoadedMsg{sessions: nil, err: err}
+	}
+	for i := range sessions {
+		sessions[i].TmuxRunning = tmux.SessionExists(sessions[i].Slug)
+	}
+	return sessionsLoadedMsg{sessions: sessions, err: nil}
 }
 
 func createWorktreeCmd(repoRoot, branch string) tea.Cmd {
@@ -142,12 +158,13 @@ func createWorktreeCmd(repoRoot, branch string) tea.Cmd {
 	}
 }
 
-func launchClaude(dir string) tea.Cmd {
-	c := exec.Command("claude")
-	c.Dir = dir
-	return tea.ExecProcess(c, func(err error) tea.Msg {
-		return claudeExitedMsg{err: err}
-	})
+func ensureAndAttachCmd(s model.Session) tea.Cmd {
+	return func() tea.Msg {
+		if err := tmux.EnsureSession(s.Slug, s.Path); err != nil {
+			return sessionEnsuredMsg{err: err}
+		}
+		return sessionEnsuredMsg{slug: s.Slug}
+	}
 }
 
 func commitCmd(path, message string) tea.Cmd {
@@ -205,7 +222,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.inputErr = ""
 		m.nameInput.Reset()
 		m.nameInput.Blur()
-		return m, launchClaude(msg.path)
+		return m, ensureAndAttachCmd(model.Session{Slug: msg.slug, Path: msg.path})
+
+	case sessionEnsuredMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		return m, tea.ExecProcess(tmux.AttachCmd(msg.slug), func(err error) tea.Msg {
+			return claudeExitedMsg{err: err}
+		})
 
 	case claudeExitedMsg:
 		// Claude exited — refresh the session list and return to the overview.
@@ -265,7 +291,7 @@ func (m Model) updateNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			s := m.selectedSession()
 			if s != nil {
-				return m, launchClaude(s.Path)
+				return m, ensureAndAttachCmd(*s)
 			}
 			return m, nil
 		}
@@ -386,8 +412,16 @@ func (m Model) renderDetail() string {
 	b.WriteString(boldStyle.Render(s.Slug) + "\n\n")
 	b.WriteString(fmt.Sprintf("Branch   %s\n", s.Branch))
 	b.WriteString(fmt.Sprintf("Path     %s\n", s.Path))
+	if s.TmuxRunning {
+		b.WriteString(fmt.Sprintf("Status   %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render("● running")))
+	} else {
+		b.WriteString(fmt.Sprintf("Status   %s\n", dimStyle.Render("idle")))
+	}
 	b.WriteString("\n")
 	b.WriteString(dimStyle.Render("────────────────────────────────\n\n"))
+	if s.TmuxRunning {
+		b.WriteString(dimStyle.Render("F12 → back to Deckard without stopping Claude\n\n"))
+	}
 	b.WriteString(dimStyle.Render("MR · CI · pipeline status in Phase 2"))
 
 	return style.Render(b.String())
@@ -400,7 +434,7 @@ func (m Model) renderHelp() string {
 	case stateCommit:
 		return helpStyle.Render("Enter commit   Esc cancel")
 	default:
-		return helpStyle.Render("↑/↓ navigate   Enter open   n new   c commit   r refresh   q quit")
+		return helpStyle.Render("↑/↓ navigate   Enter attach   n new   c commit   r refresh   q quit   F12 detach")
 	}
 }
 
