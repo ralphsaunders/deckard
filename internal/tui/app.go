@@ -48,6 +48,12 @@ var (
 			Faint(true).
 			PaddingLeft(2)
 
+	detailHeadStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("205"))
+
+	labelStyle = lipgloss.NewStyle().Faint(true)
+
 	modalStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("205")).
@@ -523,13 +529,13 @@ func (m Model) View() string {
 // — layout helpers ——————————————————————————————————————————————————————————
 
 func (m Model) listDimensions() (width, height int) {
-	return m.width / 3, m.height - 1
+	return m.width / 3, m.height - 2
 }
 
 func (m Model) renderDetail() string {
 	lw, _ := m.listDimensions()
 	dw := m.width - lw
-	dh := m.height - 1
+	dh := m.height - 2
 
 	style := lipgloss.NewStyle().
 		Border(lipgloss.NormalBorder(), false, false, false, true).
@@ -538,29 +544,40 @@ func (m Model) renderDetail() string {
 		Width(dw - 1).
 		Height(dh)
 
+	// Width of inner text area: box width minus padding
+	contentWidth := (dw - 1) - 3 - 2
+
 	s := m.selectedSession()
 	if s == nil {
 		return style.Render(dimStyle.Render("No sessions found"))
 	}
 
-	var b strings.Builder
-	b.WriteString(boldStyle.Render(s.Slug) + "\n\n")
-	b.WriteString(fmt.Sprintf("Branch   %s\n", s.Branch))
-	b.WriteString(fmt.Sprintf("Path     %s\n", s.Path))
-	switch {
-	case s.NeedsInput:
-		b.WriteString(fmt.Sprintf("Status   %s\n", warnStyle.Render("needs input")))
-	case s.TmuxRunning:
-		b.WriteString(fmt.Sprintf("Status   %s\n", okStyle.Render("● running")))
-	default:
-		b.WriteString(fmt.Sprintf("Status   %s\n", dimStyle.Render("idle")))
+	row := func(lbl, val string) string {
+		return labelStyle.Render(lbl) + val + "\n"
 	}
 
+	var statusVal string
+	switch {
+	case s.NeedsInput:
+		statusVal = warnStyle.Render("needs input")
+	case s.TmuxRunning:
+		statusVal = okStyle.Render("● running")
+	default:
+		statusVal = dimStyle.Render("idle")
+	}
+
+	sep := dimStyle.Render(strings.Repeat("─", contentWidth))
+
+	var b strings.Builder
+	b.WriteString(detailHeadStyle.Render(s.Slug) + "\n\n")
+	b.WriteString(row("Branch   ", s.Branch))
+	b.WriteString(row("Path     ", s.Path))
+	b.WriteString(row("Status   ", statusVal))
 	b.WriteString("\n")
-	b.WriteString(dimStyle.Render("────────────────────────────────\n\n"))
+	b.WriteString(sep + "\n\n")
 
 	if s.MR != nil {
-		b.WriteString(renderMR(s.MR))
+		b.WriteString(renderMR(s.MR, contentWidth))
 	} else {
 		b.WriteString(dimStyle.Render("No MR found") + "\n")
 	}
@@ -573,28 +590,46 @@ func (m Model) renderDetail() string {
 	return style.Render(b.String())
 }
 
-func renderMR(mr *model.MR) string {
+func renderMR(mr *model.MR, contentWidth int) string {
 	var b strings.Builder
 
-	mrLine := fmt.Sprintf("MR       !%d  %s\n", mr.IID, mr.Title)
-	switch mr.State {
-	case "merged":
-		b.WriteString(dimStyle.Render(mrLine))
-		b.WriteString(dimStyle.Render("         merged\n"))
-	case "closed":
-		b.WriteString(dimStyle.Render(mrLine))
-		b.WriteString(dimStyle.Render("         closed\n"))
-	default:
-		b.WriteString(mrLine)
-		b.WriteString(fmt.Sprintf("         %s\n", mr.State))
+	row := func(lbl, val string) string {
+		return labelStyle.Render(lbl) + val + "\n"
 	}
 
-	b.WriteString(fmt.Sprintf("Pipeline %s\n", pipelineLabel(mr.PipelineStatus)))
+	// Truncate title if it would overflow the content area
+	title := mr.Title
+	maxTitleLen := contentWidth - 9 // 9 = label column width
+	if maxTitleLen > 0 && len([]rune(title)) > maxTitleLen {
+		title = string([]rune(title)[:maxTitleLen-1]) + "…"
+	}
+
+	inactive := mr.State == "merged" || mr.State == "closed"
+
+	b.WriteString(row("MR       ", fmt.Sprintf("!%d", mr.IID)))
+	if inactive {
+		b.WriteString(dimStyle.Render("         "+title) + "\n")
+	} else {
+		b.WriteString("         " + title + "\n")
+	}
+
+	var stateStr string
+	switch mr.State {
+	case "merged":
+		stateStr = dimStyle.Render("merged")
+	case "closed":
+		stateStr = dimStyle.Render("closed")
+	default:
+		stateStr = okStyle.Render("open")
+	}
+	b.WriteString(row("State    ", stateStr))
+
+	b.WriteString(row("Pipeline ", pipelineLabel(mr.PipelineStatus)))
 
 	if mr.HasUnresolved {
-		b.WriteString(warnStyle.Render("Threads  unresolved comments") + "\n")
+		b.WriteString(row("Threads  ", warnStyle.Render("unresolved comments")))
 	} else if mr.PipelineStatus != "" {
-		b.WriteString(okStyle.Render("Threads  all resolved") + "\n")
+		b.WriteString(row("Threads  ", okStyle.Render("all resolved")))
 	}
 
 	return b.String()
@@ -622,16 +657,19 @@ func pipelineLabel(status string) string {
 }
 
 func (m Model) renderHelp() string {
+	var text string
 	switch m.state {
 	case stateNewSession:
-		return helpStyle.Render("Enter create   Esc cancel")
+		text = "Enter create   Esc cancel"
 	case stateCommit:
-		return helpStyle.Render("Enter commit   Esc cancel")
+		text = "Enter commit   Esc cancel"
 	case stateDeleteConfirm:
-		return helpStyle.Render("y/Enter confirm   n/Esc cancel")
+		text = "y/Enter confirm   n/Esc cancel"
 	default:
-		return helpStyle.Render("↑/↓ navigate   Enter attach   n new   c commit   o open MR   d delete   r refresh   q quit")
+		text = "↑/↓ navigate   Enter attach   n new   c commit   o open MR   d delete   r refresh   q quit"
 	}
+	sep := dimStyle.Render(strings.Repeat("─", m.width))
+	return sep + "\n" + helpStyle.Render(text)
 }
 
 func (m Model) renderModalOver(base string) string {
@@ -675,8 +713,8 @@ func (m Model) renderDeleteConfirmOver(base string) string {
 	var b strings.Builder
 	b.WriteString(errStyle.Render("Delete Worktree") + "\n\n")
 	if s != nil {
-		b.WriteString(fmt.Sprintf("Branch   %s\n", s.Branch))
-		b.WriteString(fmt.Sprintf("Path     %s\n\n", s.Path))
+		b.WriteString(labelStyle.Render("Branch   ") + s.Branch + "\n")
+		b.WriteString(labelStyle.Render("Path     ") + s.Path + "\n\n")
 		if s.MR != nil && s.MR.State == "merged" {
 			b.WriteString(okStyle.Render("MR is merged — safe to clean up") + "\n\n")
 		} else if s.MR != nil && s.MR.State == "opened" {
