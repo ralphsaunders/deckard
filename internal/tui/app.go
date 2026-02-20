@@ -35,13 +35,13 @@ const (
 var (
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("205")).
+			Foreground(lipgloss.Color("86")).
 			MarginLeft(2)
 
 	dimStyle  = lipgloss.NewStyle().Faint(true)
 	boldStyle = lipgloss.NewStyle().Bold(true)
 	errStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	okStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+	okStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("86"))
 	warnStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 
 	helpStyle = lipgloss.NewStyle().
@@ -50,18 +50,21 @@ var (
 
 	detailHeadStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("205"))
+			Foreground(lipgloss.Color("86"))
 
-	labelStyle = lipgloss.NewStyle().Faint(true)
+	// dim teal — for field labels
+	labelStyle = lipgloss.NewStyle().
+			Faint(true).
+			Foreground(lipgloss.Color("86"))
 
 	modalStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("205")).
+			Border(lipgloss.DoubleBorder()).
+			BorderForeground(lipgloss.Color("86")).
 			Padding(1, 3).
 			Width(58)
 
 	deleteModalStyle = lipgloss.NewStyle().
-				Border(lipgloss.RoundedBorder()).
+				Border(lipgloss.DoubleBorder()).
 				BorderForeground(lipgloss.Color("196")).
 				Padding(1, 3).
 				Width(58)
@@ -120,11 +123,11 @@ func (i sessionItem) Title() string {
 	var indicator string
 	switch {
 	case i.s.NeedsInput:
-		indicator = "*"
+		indicator = "▲"
 	case i.s.TmuxRunning:
 		indicator = i.spinnerChar
 	default:
-		indicator = " "
+		indicator = "·"
 	}
 	return indicator + " " + i.s.Slug
 }
@@ -153,9 +156,22 @@ func New() Model {
 	root, _ := git.RepoRoot()
 
 	delegate := list.NewDefaultDelegate()
+	// BR-style selection: teal left-bar + teal text
+	delegate.Styles.SelectedTitle = lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("86")).
+		Border(lipgloss.NormalBorder(), false, false, false, true).
+		BorderForeground(lipgloss.Color("86")).
+		PaddingLeft(1)
+	delegate.Styles.SelectedDesc = lipgloss.NewStyle().
+		Faint(true).
+		Foreground(lipgloss.Color("86")).
+		Border(lipgloss.NormalBorder(), false, false, false, true).
+		BorderForeground(lipgloss.Color("86")).
+		PaddingLeft(1)
 
 	l := list.New([]list.Item{}, delegate, 0, 0)
-	l.Title = "Worktrees"
+	l.Title = "WORKTREES"
 	l.SetShowStatusBar(false)
 	l.SetFilteringEnabled(false)
 	l.SetShowHelp(false)
@@ -503,12 +519,12 @@ func (m Model) View() string {
 	}
 
 	if m.loading {
-		return lipgloss.NewStyle().Padding(1, 2).Render("Loading worktrees…")
+		return lipgloss.NewStyle().Padding(1, 2).Render("LOADING WORKTREES…")
 	}
 
 	if m.err != nil {
 		return lipgloss.NewStyle().Padding(1, 2).Render(
-			fmt.Sprintf("Error: %v\n\nPress r to retry, q to quit.", m.err),
+			fmt.Sprintf("ERR: %v\n\nPress r to retry, q to quit.", m.err),
 		)
 	}
 
@@ -539,6 +555,7 @@ func (m Model) renderDetail() string {
 
 	style := lipgloss.NewStyle().
 		Border(lipgloss.NormalBorder(), false, false, false, true).
+		BorderForeground(lipgloss.Color("86")).
 		PaddingLeft(3).
 		PaddingRight(2).
 		Width(dw - 1).
@@ -549,7 +566,7 @@ func (m Model) renderDetail() string {
 
 	s := m.selectedSession()
 	if s == nil {
-		return style.Render(dimStyle.Render("No sessions found"))
+		return style.Render(dimStyle.Render("NO SESSIONS FOUND"))
 	}
 
 	row := func(lbl, val string) string {
@@ -559,35 +576,44 @@ func (m Model) renderDetail() string {
 	var statusVal string
 	switch {
 	case s.NeedsInput:
-		statusVal = warnStyle.Render("needs input")
+		statusVal = warnStyle.Render("▲ INPUT REQ")
 	case s.TmuxRunning:
-		statusVal = okStyle.Render("● running")
+		statusVal = okStyle.Render("◆ ACTIVE")
 	default:
-		statusVal = dimStyle.Render("idle")
+		statusVal = dimStyle.Render("· IDLE")
 	}
 
-	sep := dimStyle.Render(strings.Repeat("─", contentWidth))
-
 	var b strings.Builder
-	b.WriteString(detailHeadStyle.Render(s.Slug) + "\n\n")
-	b.WriteString(row("Branch   ", s.Branch))
-	b.WriteString(row("Path     ", s.Path))
-	b.WriteString(row("Status   ", statusVal))
+	b.WriteString(detailHeadStyle.Render(strings.ToUpper(s.Slug)) + "\n\n")
+	b.WriteString(row("BRANCH   ", s.Branch))
+	b.WriteString(row("PATH     ", s.Path))
+	b.WriteString(row("STATUS   ", statusVal))
 	b.WriteString("\n")
-	b.WriteString(sep + "\n\n")
+	b.WriteString(sectionSep("MR", contentWidth) + "\n\n")
 
 	if s.MR != nil {
 		b.WriteString(renderMR(s.MR, contentWidth))
 	} else {
-		b.WriteString(dimStyle.Render("No MR found") + "\n")
+		b.WriteString(dimStyle.Render("NO MR FOUND") + "\n")
 	}
 
 	b.WriteString("\n")
 	if s.TmuxRunning {
-		b.WriteString(dimStyle.Render("Ctrl+] → back to Deckard without stopping Claude\n"))
+		b.WriteString(dimStyle.Render("CTRL+]  DETACH WITHOUT STOPPING CLAUDE\n"))
 	}
 
 	return style.Render(b.String())
+}
+
+// sectionSep renders a labeled divider: "─── LABEL ──────────────"
+func sectionSep(label string, width int) string {
+	const pre = "─── "
+	content := pre + label + " "
+	remaining := width - len([]rune(content))
+	if remaining < 0 {
+		remaining = 0
+	}
+	return dimStyle.Render(content + strings.Repeat("─", remaining))
 }
 
 func renderMR(mr *model.MR, contentWidth int) string {
@@ -616,20 +642,20 @@ func renderMR(mr *model.MR, contentWidth int) string {
 	var stateStr string
 	switch mr.State {
 	case "merged":
-		stateStr = dimStyle.Render("merged")
+		stateStr = dimStyle.Render("MERGED")
 	case "closed":
-		stateStr = dimStyle.Render("closed")
+		stateStr = dimStyle.Render("CLOSED")
 	default:
-		stateStr = okStyle.Render("open")
+		stateStr = okStyle.Render("OPEN")
 	}
-	b.WriteString(row("State    ", stateStr))
+	b.WriteString(row("STATE    ", stateStr))
 
-	b.WriteString(row("Pipeline ", pipelineLabel(mr.PipelineStatus)))
+	b.WriteString(row("PIPELINE ", pipelineLabel(mr.PipelineStatus)))
 
 	if mr.HasUnresolved {
-		b.WriteString(row("Threads  ", warnStyle.Render("unresolved comments")))
+		b.WriteString(row("THREADS  ", warnStyle.Render("▲ UNRESOLVED")))
 	} else if mr.PipelineStatus != "" {
-		b.WriteString(row("Threads  ", okStyle.Render("all resolved")))
+		b.WriteString(row("THREADS  ", okStyle.Render("◆ RESOLVED")))
 	}
 
 	return b.String()
@@ -638,19 +664,19 @@ func renderMR(mr *model.MR, contentWidth int) string {
 func pipelineLabel(status string) string {
 	switch status {
 	case "success":
-		return okStyle.Render("✅ passed")
+		return okStyle.Render("◆ PASSED")
 	case "failed":
-		return errStyle.Render("❌ failed")
+		return errStyle.Render("✕ FAILED")
 	case "running":
-		return warnStyle.Render("⏳ running")
+		return warnStyle.Render("~ RUNNING")
 	case "pending", "waiting_for_resource", "preparing", "scheduled":
-		return warnStyle.Render("⏳ pending")
+		return warnStyle.Render("◇ PENDING")
 	case "canceled":
-		return dimStyle.Render("⊘ canceled")
+		return dimStyle.Render("· CANCELED")
 	case "skipped":
-		return dimStyle.Render("— skipped")
+		return dimStyle.Render("· SKIPPED")
 	case "":
-		return dimStyle.Render("—")
+		return dimStyle.Render("─")
 	default:
 		return dimStyle.Render(status)
 	}
@@ -674,13 +700,13 @@ func (m Model) renderHelp() string {
 
 func (m Model) renderModalOver(base string) string {
 	var b strings.Builder
-	b.WriteString(boldStyle.Render("New Session") + "\n\n")
-	b.WriteString("Branch name\n")
+	b.WriteString(detailHeadStyle.Render("NEW SESSION") + "\n\n")
+	b.WriteString(labelStyle.Render("BRANCH NAME") + "\n")
 	b.WriteString(m.nameInput.View() + "\n")
 	if m.inputErr != "" {
 		b.WriteString("\n" + errStyle.Render(m.inputErr) + "\n")
 	}
-	b.WriteString("\n" + dimStyle.Render("Creates .claude/worktrees/<slug> · opens claude"))
+	b.WriteString("\n" + dimStyle.Render("creates .claude/worktrees/<slug> · opens claude"))
 
 	modal := modalStyle.Render(b.String())
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal,
@@ -691,16 +717,16 @@ func (m Model) renderModalOver(base string) string {
 func (m Model) renderCommitModalOver(base string) string {
 	s := m.selectedSession()
 	var b strings.Builder
-	b.WriteString(boldStyle.Render("Commit Changes") + "\n\n")
+	b.WriteString(detailHeadStyle.Render("COMMIT CHANGES") + "\n\n")
 	if s != nil {
-		b.WriteString(dimStyle.Render(s.Slug) + "\n\n")
+		b.WriteString(dimStyle.Render(strings.ToUpper(s.Slug)) + "\n\n")
 	}
-	b.WriteString("Commit message\n")
+	b.WriteString(labelStyle.Render("COMMIT MESSAGE") + "\n")
 	b.WriteString(m.nameInput.View() + "\n")
 	if m.inputErr != "" {
 		b.WriteString("\n" + errStyle.Render(m.inputErr) + "\n")
 	}
-	b.WriteString("\n" + dimStyle.Render("Stages all changes · git add -A · git commit"))
+	b.WriteString("\n" + dimStyle.Render("stages all changes · git add -A · git commit"))
 
 	modal := modalStyle.Render(b.String())
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal,
@@ -711,14 +737,14 @@ func (m Model) renderCommitModalOver(base string) string {
 func (m Model) renderDeleteConfirmOver(base string) string {
 	s := m.selectedSession()
 	var b strings.Builder
-	b.WriteString(errStyle.Render("Delete Worktree") + "\n\n")
+	b.WriteString(errStyle.Render("DELETE WORKTREE") + "\n\n")
 	if s != nil {
-		b.WriteString(labelStyle.Render("Branch   ") + s.Branch + "\n")
-		b.WriteString(labelStyle.Render("Path     ") + s.Path + "\n\n")
+		b.WriteString(labelStyle.Render("BRANCH   ") + s.Branch + "\n")
+		b.WriteString(labelStyle.Render("PATH     ") + s.Path + "\n\n")
 		if s.MR != nil && s.MR.State == "merged" {
-			b.WriteString(okStyle.Render("MR is merged — safe to clean up") + "\n\n")
+			b.WriteString(okStyle.Render("◆ MR merged — safe to clean up") + "\n\n")
 		} else if s.MR != nil && s.MR.State == "opened" {
-			b.WriteString(warnStyle.Render("⚠  MR is still open") + "\n\n")
+			b.WriteString(warnStyle.Render("▲ MR is still open") + "\n\n")
 		}
 	}
 	b.WriteString("This will run git worktree remove and delete the branch.\n")
