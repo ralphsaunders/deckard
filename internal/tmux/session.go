@@ -27,8 +27,8 @@ func configPath() (string, error) {
 		return "", fmt.Errorf("mkdir: %w", err)
 	}
 	const conf = "# Deckard tmux config — do not edit manually\n" +
-		"# F12 returns you to the Deckard dashboard without stopping Claude\n" +
-		"bind-key -n F12 detach-client\n"
+		"# Ctrl+] returns you to the Deckard dashboard without stopping Claude\n" +
+		"bind-key -n C-] detach-client\n"
 	if err := os.WriteFile(p, []byte(conf), 0644); err != nil {
 		return "", fmt.Errorf("write config: %w", err)
 	}

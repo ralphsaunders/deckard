@@ -420,7 +420,7 @@ func (m Model) renderDetail() string {
 	b.WriteString("\n")
 	b.WriteString(dimStyle.Render("────────────────────────────────\n\n"))
 	if s.TmuxRunning {
-		b.WriteString(dimStyle.Render("F12 → back to Deckard without stopping Claude\n\n"))
+		b.WriteString(dimStyle.Render("Ctrl+] → back to Deckard without stopping Claude\n\n"))
 	}
 	b.WriteString(dimStyle.Render("MR · CI · pipeline status in Phase 2"))
 
@@ -434,7 +434,7 @@ func (m Model) renderHelp() string {
 	case stateCommit:
 		return helpStyle.Render("Enter commit   Esc cancel")
 	default:
-		return helpStyle.Render("↑/↓ navigate   Enter attach   n new   c commit   r refresh   q quit   F12 detach")
+		return helpStyle.Render("↑/↓ navigate   Enter attach   n new   c commit   r refresh   q quit   Ctrl+] detach")
 	}
 }
 
