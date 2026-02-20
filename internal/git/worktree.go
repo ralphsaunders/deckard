@@ -87,6 +87,19 @@ func parseBlock(block string) *model.Session {
 	}
 }
 
+// DeleteWorktree removes the worktree at path and attempts to delete the branch.
+// The repoRoot is used as the working directory for git commands.
+func DeleteWorktree(repoRoot, path, branch string) error {
+	cmd := exec.Command("git", "worktree", "remove", path)
+	cmd.Dir = repoRoot
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+	}
+	// Best-effort branch deletion — ignore errors (e.g. branch not fully merged).
+	exec.Command("git", "-C", repoRoot, "branch", "-d", branch).Run()
+	return nil
+}
+
 // BranchToSlug normalises a branch name into a filesystem/tmux-safe slug.
 func BranchToSlug(branch string) string {
 	if branch == "" {

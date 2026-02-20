@@ -3,7 +3,9 @@ package tui
 import (
 	"fmt"
 	"os/exec"
+	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -11,6 +13,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"deckard/internal/git"
+	"deckard/internal/gitlab"
 	"deckard/internal/model"
 	"deckard/internal/tmux"
 )
@@ -23,6 +26,7 @@ const (
 	stateNormal appState = iota
 	stateNewSession
 	stateCommit
+	stateDeleteConfirm
 )
 
 // — styles ——————————————————————————————————————————————————————————————————
@@ -36,6 +40,8 @@ var (
 	dimStyle  = lipgloss.NewStyle().Faint(true)
 	boldStyle = lipgloss.NewStyle().Bold(true)
 	errStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	okStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+	warnStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 
 	helpStyle = lipgloss.NewStyle().
 			Faint(true).
@@ -46,6 +52,12 @@ var (
 			BorderForeground(lipgloss.Color("205")).
 			Padding(1, 3).
 			Width(58)
+
+	deleteModalStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("196")).
+				Padding(1, 3).
+				Width(58)
 )
 
 // — messages ————————————————————————————————————————————————————————————————
@@ -74,6 +86,10 @@ type commitResultMsg struct {
 	err error
 }
 
+type worktreeRemovedMsg struct {
+	err error
+}
+
 // — list item ———————————————————————————————————————————————————————————————
 
 type sessionItem struct {
@@ -92,7 +108,7 @@ func (i sessionItem) Title() string {
 }
 
 func (i sessionItem) Description() string { return i.s.Branch }
-func (i sessionItem) FilterValue() string { return i.s.Slug }
+func (i sessionItem) FilterValue() string  { return i.s.Slug }
 
 // — model ———————————————————————————————————————————————————————————————————
 
@@ -141,9 +157,24 @@ func fetchSessions() tea.Msg {
 	if err != nil {
 		return sessionsLoadedMsg{sessions: nil, err: err}
 	}
+
+	// Enrich sessions concurrently: tmux status + GitLab MR data.
+	var wg sync.WaitGroup
 	for i := range sessions {
 		sessions[i].TmuxRunning = tmux.SessionExists(sessions[i].Slug)
+
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			mr, _ := gitlab.FetchMR(sessions[i].Branch)
+			sessions[i].MR = mr
+			if mr != nil {
+				sessions[i].NeedsInput = mr.PipelineStatus == "failed" || mr.HasUnresolved
+			}
+		}(i)
 	}
+	wg.Wait()
+
 	return sessionsLoadedMsg{sessions: sessions, err: nil}
 }
 
@@ -180,6 +211,29 @@ func commitCmd(path, message string) tea.Cmd {
 		}
 		_ = out
 		return commitResultMsg{}
+	}
+}
+
+func openURLCmd(url string) tea.Cmd {
+	return func() tea.Msg {
+		var cmd *exec.Cmd
+		switch runtime.GOOS {
+		case "darwin":
+			cmd = exec.Command("open", url)
+		case "windows":
+			cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+		default:
+			cmd = exec.Command("xdg-open", url)
+		}
+		cmd.Run()
+		return nil
+	}
+}
+
+func deleteWorktreeCmd(repoRoot, path, branch string) tea.Cmd {
+	return func() tea.Msg {
+		err := git.DeleteWorktree(repoRoot, path, branch)
+		return worktreeRemovedMsg{err: err}
 	}
 }
 
@@ -249,6 +303,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.nameInput.Blur()
 		m.loading = true
 		return m, fetchSessions
+
+	case worktreeRemovedMsg:
+		if msg.err != nil {
+			m.inputErr = msg.err.Error()
+			m.state = stateNormal
+			return m, nil
+		}
+		m.state = stateNormal
+		m.inputErr = ""
+		m.loading = true
+		return m, fetchSessions
 	}
 
 	switch m.state {
@@ -256,6 +321,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateNewSession(msg)
 	case stateCommit:
 		return m.updateCommit(msg)
+	case stateDeleteConfirm:
+		return m.updateDeleteConfirm(msg)
 	default:
 		return m.updateNormal(msg)
 	}
@@ -286,6 +353,20 @@ func (m Model) updateNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.nameInput.Reset()
 				m.nameInput.Focus()
 				return m, textinput.Blink
+			}
+			return m, nil
+		case "o":
+			s := m.selectedSession()
+			if s != nil && s.MR != nil && s.MR.WebURL != "" {
+				return m, openURLCmd(s.MR.WebURL)
+			}
+			return m, nil
+		case "d":
+			s := m.selectedSession()
+			if s != nil && s.Path != m.repoRoot {
+				m.state = stateDeleteConfirm
+				m.inputErr = ""
+				return m, nil
 			}
 			return m, nil
 		case "enter":
@@ -358,6 +439,26 @@ func (m Model) updateCommit(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m Model) updateDeleteConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "esc", "n", "N":
+			m.state = stateNormal
+			m.inputErr = ""
+			return m, nil
+		case "enter", "y", "Y":
+			s := m.selectedSession()
+			if s == nil {
+				m.state = stateNormal
+				return m, nil
+			}
+			return m, deleteWorktreeCmd(m.repoRoot, s.Path, s.Branch)
+		}
+	}
+	return m, nil
+}
+
 func (m Model) View() string {
 	if m.width == 0 {
 		return ""
@@ -376,11 +477,13 @@ func (m Model) View() string {
 	body := lipgloss.JoinHorizontal(lipgloss.Top, m.list.View(), m.renderDetail())
 	base := lipgloss.JoinVertical(lipgloss.Left, body, m.renderHelp())
 
-	if m.state == stateNewSession {
+	switch m.state {
+	case stateNewSession:
 		return m.renderModalOver(base)
-	}
-	if m.state == stateCommit {
+	case stateCommit:
 		return m.renderCommitModalOver(base)
+	case stateDeleteConfirm:
+		return m.renderDeleteConfirmOver(base)
 	}
 	return base
 }
@@ -413,18 +516,74 @@ func (m Model) renderDetail() string {
 	b.WriteString(fmt.Sprintf("Branch   %s\n", s.Branch))
 	b.WriteString(fmt.Sprintf("Path     %s\n", s.Path))
 	if s.TmuxRunning {
-		b.WriteString(fmt.Sprintf("Status   %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render("● running")))
+		b.WriteString(fmt.Sprintf("Status   %s\n", okStyle.Render("● running")))
 	} else {
 		b.WriteString(fmt.Sprintf("Status   %s\n", dimStyle.Render("idle")))
 	}
+
 	b.WriteString("\n")
 	b.WriteString(dimStyle.Render("────────────────────────────────\n\n"))
-	if s.TmuxRunning {
-		b.WriteString(dimStyle.Render("Ctrl+] → back to Deckard without stopping Claude\n\n"))
+
+	if s.MR != nil {
+		b.WriteString(renderMR(s.MR))
+	} else {
+		b.WriteString(dimStyle.Render("No MR found") + "\n")
 	}
-	b.WriteString(dimStyle.Render("MR · CI · pipeline status in Phase 2"))
+
+	b.WriteString("\n")
+	if s.TmuxRunning {
+		b.WriteString(dimStyle.Render("Ctrl+] → back to Deckard without stopping Claude\n"))
+	}
 
 	return style.Render(b.String())
+}
+
+func renderMR(mr *model.MR) string {
+	var b strings.Builder
+
+	mrLine := fmt.Sprintf("MR       !%d  %s\n", mr.IID, mr.Title)
+	switch mr.State {
+	case "merged":
+		b.WriteString(dimStyle.Render(mrLine))
+		b.WriteString(dimStyle.Render("         merged\n"))
+	case "closed":
+		b.WriteString(dimStyle.Render(mrLine))
+		b.WriteString(dimStyle.Render("         closed\n"))
+	default:
+		b.WriteString(mrLine)
+		b.WriteString(fmt.Sprintf("         %s\n", mr.State))
+	}
+
+	b.WriteString(fmt.Sprintf("Pipeline %s\n", pipelineLabel(mr.PipelineStatus)))
+
+	if mr.HasUnresolved {
+		b.WriteString(warnStyle.Render("Threads  unresolved comments") + "\n")
+	} else if mr.PipelineStatus != "" {
+		b.WriteString(okStyle.Render("Threads  all resolved") + "\n")
+	}
+
+	return b.String()
+}
+
+func pipelineLabel(status string) string {
+	switch status {
+	case "success":
+		return okStyle.Render("✅ passed")
+	case "failed":
+		return errStyle.Render("❌ failed")
+	case "running":
+		return warnStyle.Render("⏳ running")
+	case "pending", "waiting_for_resource", "preparing", "scheduled":
+		return warnStyle.Render("⏳ pending")
+	case "canceled":
+		return dimStyle.Render("⊘ canceled")
+	case "skipped":
+		return dimStyle.Render("— skipped")
+	case "":
+		return dimStyle.Render("—")
+	default:
+		return dimStyle.Render(status)
+	}
 }
 
 func (m Model) renderHelp() string {
@@ -433,8 +592,10 @@ func (m Model) renderHelp() string {
 		return helpStyle.Render("Enter create   Esc cancel")
 	case stateCommit:
 		return helpStyle.Render("Enter commit   Esc cancel")
+	case stateDeleteConfirm:
+		return helpStyle.Render("y/Enter confirm   n/Esc cancel")
 	default:
-		return helpStyle.Render("↑/↓ navigate   Enter attach   n new   c commit   r refresh   q quit   Ctrl+] detach")
+		return helpStyle.Render("↑/↓ navigate   Enter attach   n new   c commit   o open MR   d delete   r refresh   q quit")
 	}
 }
 
@@ -469,6 +630,31 @@ func (m Model) renderCommitModalOver(base string) string {
 	b.WriteString("\n" + dimStyle.Render("Stages all changes · git add -A · git commit"))
 
 	modal := modalStyle.Render(b.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal,
+		lipgloss.WithWhitespaceBackground(lipgloss.Color("0")),
+	)
+}
+
+func (m Model) renderDeleteConfirmOver(base string) string {
+	s := m.selectedSession()
+	var b strings.Builder
+	b.WriteString(errStyle.Render("Delete Worktree") + "\n\n")
+	if s != nil {
+		b.WriteString(fmt.Sprintf("Branch   %s\n", s.Branch))
+		b.WriteString(fmt.Sprintf("Path     %s\n\n", s.Path))
+		if s.MR != nil && s.MR.State == "merged" {
+			b.WriteString(okStyle.Render("MR is merged — safe to clean up") + "\n\n")
+		} else if s.MR != nil && s.MR.State == "opened" {
+			b.WriteString(warnStyle.Render("⚠  MR is still open") + "\n\n")
+		}
+	}
+	b.WriteString("This will run git worktree remove and delete the branch.\n")
+	if m.inputErr != "" {
+		b.WriteString("\n" + errStyle.Render(m.inputErr) + "\n")
+	}
+	b.WriteString("\n" + dimStyle.Render("y/Enter to confirm · Esc/n to cancel"))
+
+	modal := deleteModalStyle.Render(b.String())
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal,
 		lipgloss.WithWhitespaceBackground(lipgloss.Color("0")),
 	)
