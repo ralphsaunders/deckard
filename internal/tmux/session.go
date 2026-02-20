@@ -1,10 +1,12 @@
 package tmux
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 )
 
 const socketName = "deckard"
@@ -12,6 +14,21 @@ const socketName = "deckard"
 // SessionExists reports whether a named session exists on the Deckard socket.
 func SessionExists(slug string) bool {
 	return exec.Command("tmux", "-L", socketName, "has-session", "-t", slug).Run() == nil
+}
+
+// NeedsInput reports whether the named session is idle and awaiting input.
+// It takes two pane snapshots 300 ms apart: a static pane means Claude has
+// finished and is waiting; a changing pane means Claude is still processing.
+func NeedsInput(slug string) bool {
+	snap := func() []byte {
+		out, _ := exec.Command("tmux", "-L", socketName,
+			"capture-pane", "-t", slug, "-p", "-J").Output()
+		return out
+	}
+	a := snap()
+	time.Sleep(300 * time.Millisecond)
+	b := snap()
+	return bytes.Equal(a, b)
 }
 
 // configPath returns the Deckard tmux config path, writing defaults if absent.

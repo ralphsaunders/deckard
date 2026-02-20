@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -48,6 +49,18 @@ var (
 			Width(58)
 )
 
+// — spinner —————————————————————————————————————————————————————————————————
+
+var spinnerFrames = []string{"|", "/", "-", "\\"}
+
+type tickMsg struct{}
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg {
+		return tickMsg{}
+	})
+}
+
 // — messages ————————————————————————————————————————————————————————————————
 
 type sessionsLoadedMsg struct {
@@ -77,18 +90,21 @@ type commitResultMsg struct {
 // — list item ———————————————————————————————————————————————————————————————
 
 type sessionItem struct {
-	s model.Session
+	s           model.Session
+	spinnerChar string
 }
 
 func (i sessionItem) Title() string {
-	prefix := ""
-	if i.s.NeedsInput {
-		prefix = "* "
+	var indicator string
+	switch {
+	case i.s.NeedsInput:
+		indicator = "*"
+	case i.s.TmuxRunning:
+		indicator = i.spinnerChar
+	default:
+		indicator = " "
 	}
-	if i.s.TmuxRunning {
-		return prefix + i.s.Slug + " ●"
-	}
-	return prefix + i.s.Slug
+	return indicator + " " + i.s.Slug
 }
 
 func (i sessionItem) Description() string { return i.s.Branch }
@@ -105,9 +121,10 @@ type Model struct {
 	err      error
 	repoRoot string
 
-	state     appState
-	nameInput textinput.Model
-	inputErr  string
+	state        appState
+	nameInput    textinput.Model
+	inputErr     string
+	spinnerFrame int
 }
 
 func New() Model {
@@ -141,9 +158,30 @@ func fetchSessions() tea.Msg {
 	if err != nil {
 		return sessionsLoadedMsg{sessions: nil, err: err}
 	}
-	for i := range sessions {
-		sessions[i].TmuxRunning = tmux.SessionExists(sessions[i].Slug)
+
+	type result struct {
+		idx        int
+		running    bool
+		needsInput bool
 	}
+	ch := make(chan result, len(sessions))
+	for i, s := range sessions {
+		i, s := i, s
+		go func() {
+			exists := tmux.SessionExists(s.Slug)
+			needs := false
+			if exists {
+				needs = tmux.NeedsInput(s.Slug)
+			}
+			ch <- result{i, exists, needs}
+		}()
+	}
+	for range sessions {
+		r := <-ch
+		sessions[r.idx].TmuxRunning = r.running
+		sessions[r.idx].NeedsInput = r.needsInput
+	}
+
 	return sessionsLoadedMsg{sessions: sessions, err: nil}
 }
 
@@ -183,10 +221,20 @@ func commitCmd(path, message string) tea.Cmd {
 	}
 }
 
+// buildItems rebuilds the list items with the current spinner frame.
+func (m *Model) buildItems() {
+	char := spinnerFrames[m.spinnerFrame]
+	items := make([]list.Item, len(m.sessions))
+	for i, s := range m.sessions {
+		items[i] = sessionItem{s: s, spinnerChar: char}
+	}
+	m.list.SetItems(items)
+}
+
 // — tea.Model ———————————————————————————————————————————————————————————————
 
 func (m Model) Init() tea.Cmd {
-	return fetchSessions
+	return tea.Batch(fetchSessions, tickCmd())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -198,6 +246,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.list.SetSize(lw, lh)
 		return m, nil
 
+	case tickMsg:
+		m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
+		if !m.loading && m.err == nil {
+			m.buildItems()
+		}
+		return m, tickCmd()
+
 	case sessionsLoadedMsg:
 		m.loading = false
 		if msg.err != nil {
@@ -206,11 +261,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.err = nil
 		m.sessions = msg.sessions
-		items := make([]list.Item, len(msg.sessions))
-		for i, s := range msg.sessions {
-			items[i] = sessionItem{s: s}
-		}
-		m.list.SetItems(items)
+		m.buildItems()
 		return m, nil
 
 	case worktreeCreatedMsg:
@@ -412,9 +463,14 @@ func (m Model) renderDetail() string {
 	b.WriteString(boldStyle.Render(s.Slug) + "\n\n")
 	b.WriteString(fmt.Sprintf("Branch   %s\n", s.Branch))
 	b.WriteString(fmt.Sprintf("Path     %s\n", s.Path))
-	if s.TmuxRunning {
-		b.WriteString(fmt.Sprintf("Status   %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render("● running")))
-	} else {
+	switch {
+	case s.NeedsInput && s.TmuxRunning:
+		b.WriteString(fmt.Sprintf("Status   %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Render("needs input")))
+	case s.NeedsInput:
+		b.WriteString(fmt.Sprintf("Status   %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Render("needs input")))
+	case s.TmuxRunning:
+		b.WriteString(fmt.Sprintf("Status   %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render("running")))
+	default:
 		b.WriteString(fmt.Sprintf("Status   %s\n", dimStyle.Render("idle")))
 	}
 	b.WriteString("\n")
