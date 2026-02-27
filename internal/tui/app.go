@@ -13,8 +13,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"deckard/internal/forge"
 	"deckard/internal/git"
-	"deckard/internal/gitlab"
 	"deckard/internal/model"
 	"deckard/internal/tmux"
 )
@@ -29,6 +29,17 @@ const (
 	stateCommitType
 	stateCommit
 	stateDeleteConfirm
+	stateCreatePR   // creating a new PR/MR
+	stateManagePR   // submenu for existing PR/MR
+)
+
+// createPRField tracks which field in the create modal is focused.
+type createPRField int
+
+const (
+	fieldTitle createPRField = iota
+	fieldBase
+	fieldDraft
 )
 
 // — conventional commit types ————————————————————————————————————————————————
@@ -88,6 +99,18 @@ var (
 				BorderForeground(lipgloss.Color("196")).
 				Padding(1, 3).
 				Width(58)
+
+	statusInfoStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("86")).
+			PaddingLeft(2)
+
+	statusWarnStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("214")).
+			PaddingLeft(2)
+
+	statusErrStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("196")).
+			PaddingLeft(2)
 )
 
 // — spinner —————————————————————————————————————————————————————————————————
@@ -132,6 +155,36 @@ type worktreeRemovedMsg struct {
 	err error
 }
 
+type pushResultMsg struct {
+	err error
+}
+
+type prCreatedMsg struct {
+	err error
+}
+
+type prUpdatedMsg struct {
+	err error
+}
+
+type clearStatusMsg struct{}
+
+// — status notification ——————————————————————————————————————————————————————
+
+type statusLevel int
+
+const (
+	statusInfo statusLevel = iota
+	statusWarn
+	statusError
+)
+
+func clearStatusCmd() tea.Cmd {
+	return tea.Tick(3*time.Second, func(time.Time) tea.Msg {
+		return clearStatusMsg{}
+	})
+}
+
 // — list item ———————————————————————————————————————————————————————————————
 
 type sessionItem struct {
@@ -165,16 +218,28 @@ type Model struct {
 	loading  bool
 	err      error
 	repoRoot string
+	forge    forge.Forge
 
 	state        appState
 	nameInput    textinput.Model
 	inputErr     string
 	spinnerFrame int
 	commitType   string
+
+	// create PR state
+	createPRTitle    textinput.Model
+	createPRBase     textinput.Model
+	createPRDraft    bool
+	createPRField    createPRField
+
+	// status notification
+	statusText  string
+	statusLevel statusLevel
 }
 
 func New() Model {
 	root, _ := git.RepoRoot()
+	f := forge.Detect(root)
 
 	delegate := list.NewDefaultDelegate()
 	// BR-style selection: teal left-bar + teal text
@@ -202,23 +267,40 @@ func New() Model {
 	ti.Placeholder = "e.g. phase-2-gitlab-mr-linking"
 	ti.CharLimit = 100
 
+	prTitle := textinput.New()
+	prTitle.Placeholder = "short description"
+	prTitle.CharLimit = 120
+
+	prBase := textinput.New()
+	prBase.Placeholder = "main"
+	prBase.CharLimit = 60
+	if root != "" {
+		prBase.SetValue(forge.DefaultBranch(root))
+	} else {
+		prBase.SetValue("main")
+	}
+
 	return Model{
-		list:      l,
-		repoRoot:  root,
-		loading:   true,
-		nameInput: ti,
+		list:          l,
+		repoRoot:      root,
+		forge:         f,
+		loading:       true,
+		nameInput:     ti,
+		createPRTitle: prTitle,
+		createPRBase:  prBase,
 	}
 }
 
 // — commands ————————————————————————————————————————————————————————————————
 
-func fetchSessions() tea.Msg {
+func (m *Model) fetchSessionsCmd() tea.Msg {
 	sessions, err := git.ListWorktrees()
 	if err != nil {
 		return sessionsLoadedMsg{sessions: nil, err: err}
 	}
 
-	// Enrich sessions concurrently: tmux status + GitLab MR data.
+	f := m.forge
+
 	var wg sync.WaitGroup
 	for i := range sessions {
 		wg.Add(1)
@@ -228,10 +310,12 @@ func fetchSessions() tea.Msg {
 			if sessions[i].TmuxRunning {
 				sessions[i].NeedsInput = tmux.NeedsInput(sessions[i].Slug)
 			}
-			mr, _ := gitlab.FetchMR(sessions[i].Branch)
-			sessions[i].MR = mr
-			if mr != nil {
-				sessions[i].NeedsInput = mr.PipelineStatus == "failed" || mr.HasUnresolved
+			if f != nil {
+				pr, _ := f.FetchPR(sessions[i].Branch)
+				sessions[i].PR = pr
+				if pr != nil {
+					sessions[i].NeedsInput = pr.PipelineStatus == "failed" || pr.HasUnresolved
+				}
 			}
 		}(i)
 	}
@@ -276,6 +360,33 @@ func commitCmd(path, message string) tea.Cmd {
 	}
 }
 
+func pushCmd(repoPath, branch string) tea.Cmd {
+	return func() tea.Msg {
+		err := git.Push(repoPath, branch)
+		return pushResultMsg{err: err}
+	}
+}
+
+func createPRCmd(f forge.Forge, repoPath, branch string, opts forge.CreateOpts) tea.Cmd {
+	return func() tea.Msg {
+		// Ensure branch is pushed before creating PR.
+		if !git.HasUpstream(repoPath, branch) {
+			if err := git.Push(repoPath, branch); err != nil {
+				return prCreatedMsg{err: fmt.Errorf("push failed: %w", err)}
+			}
+		}
+		_, err := f.CreatePR(opts)
+		return prCreatedMsg{err: err}
+	}
+}
+
+func updatePRCmd(f forge.Forge, number int, opts forge.UpdateOpts) tea.Cmd {
+	return func() tea.Msg {
+		_, err := f.UpdatePR(number, opts)
+		return prUpdatedMsg{err: err}
+	}
+}
+
 // buildItems rebuilds the list items with the current spinner frame.
 func (m *Model) buildItems() {
 	char := spinnerFrames[m.spinnerFrame]
@@ -312,7 +423,7 @@ func deleteWorktreeCmd(repoRoot, path, branch string) tea.Cmd {
 // — tea.Model ———————————————————————————————————————————————————————————————
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(fetchSessions, tickCmd())
+	return tea.Batch(m.fetchSessionsCmd, tickCmd())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -330,6 +441,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.buildItems()
 		}
 		return m, tickCmd()
+
+	case clearStatusMsg:
+		m.statusText = ""
+		return m, nil
 
 	case sessionsLoadedMsg:
 		m.loading = false
@@ -363,9 +478,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		})
 
 	case claudeExitedMsg:
-		// Claude exited — refresh the session list and return to the overview.
 		m.loading = true
-		return m, fetchSessions
+		return m, m.fetchSessionsCmd
 
 	case commitResultMsg:
 		if msg.err != nil {
@@ -377,7 +491,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.nameInput.Reset()
 		m.nameInput.Blur()
 		m.loading = true
-		return m, fetchSessions
+		m.setStatus(statusInfo, "◆ committed")
+		return m, tea.Batch(m.fetchSessionsCmd, clearStatusCmd())
 
 	case worktreeRemovedMsg:
 		if msg.err != nil {
@@ -388,7 +503,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = stateNormal
 		m.inputErr = ""
 		m.loading = true
-		return m, fetchSessions
+		return m, m.fetchSessionsCmd
+
+	case pushResultMsg:
+		if msg.err != nil {
+			m.setStatus(statusError, "✕ push failed: "+msg.err.Error())
+		} else {
+			m.setStatus(statusInfo, "◆ pushed")
+		}
+		m.loading = true
+		return m, tea.Batch(m.fetchSessionsCmd, clearStatusCmd())
+
+	case prCreatedMsg:
+		if msg.err != nil {
+			m.inputErr = msg.err.Error()
+			return m, nil
+		}
+		m.state = stateNormal
+		m.inputErr = ""
+		m.setStatus(statusInfo, "◆ PR created")
+		m.loading = true
+		return m, tea.Batch(m.fetchSessionsCmd, clearStatusCmd())
+
+	case prUpdatedMsg:
+		if msg.err != nil {
+			m.setStatus(statusError, "✕ "+msg.err.Error())
+			m.state = stateNormal
+			return m, tea.Batch(clearStatusCmd())
+		}
+		m.state = stateNormal
+		m.setStatus(statusInfo, "◆ PR updated")
+		m.loading = true
+		return m, tea.Batch(m.fetchSessionsCmd, clearStatusCmd())
 	}
 
 	switch m.state {
@@ -400,9 +546,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateCommit(msg)
 	case stateDeleteConfirm:
 		return m.updateDeleteConfirm(msg)
+	case stateCreatePR:
+		return m.updateCreatePR(msg)
+	case stateManagePR:
+		return m.updateManagePR(msg)
 	default:
 		return m.updateNormal(msg)
 	}
+}
+
+func (m *Model) setStatus(level statusLevel, text string) {
+	m.statusText = text
+	m.statusLevel = level
 }
 
 func (m Model) updateNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -413,7 +568,7 @@ func (m Model) updateNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "r":
 			m.loading = true
-			return m, fetchSessions
+			return m, m.fetchSessionsCmd
 		case "n":
 			m.state = stateNewSession
 			m.inputErr = ""
@@ -430,11 +585,28 @@ func (m Model) updateNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, nil
+		case "p":
+			s := m.selectedSession()
+			if s != nil {
+				return m, pushCmd(s.Path, s.Branch)
+			}
+			return m, nil
 		case "o":
 			s := m.selectedSession()
-			if s != nil && s.MR != nil && s.MR.WebURL != "" {
-				return m, openURLCmd(s.MR.WebURL)
+			if s != nil && s.PR != nil && s.PR.WebURL != "" {
+				return m, openURLCmd(s.PR.WebURL)
 			}
+			return m, nil
+		case "m":
+			s := m.selectedSession()
+			if s == nil || m.forge == nil {
+				return m, nil
+			}
+			if s.PR == nil {
+				return m.enterCreatePR(s)
+			}
+			m.state = stateManagePR
+			m.inputErr = ""
 			return m, nil
 		case "d":
 			s := m.selectedSession()
@@ -455,6 +627,136 @@ func (m Model) updateNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.list, cmd = m.list.Update(msg)
 	return m, cmd
+}
+
+func (m Model) enterCreatePR(s *model.Session) (tea.Model, tea.Cmd) {
+	m.state = stateCreatePR
+	m.inputErr = ""
+	m.createPRDraft = false
+	m.createPRField = fieldTitle
+
+	// Pre-fill title from branch slug: replace hyphens with spaces, title-case first word.
+	title := slugToTitle(s.Branch)
+	m.createPRTitle.Reset()
+	m.createPRTitle.SetValue(title)
+	m.createPRTitle.Focus()
+
+	// Reset base to repo default.
+	base := forge.DefaultBranch(m.repoRoot)
+	m.createPRBase.Reset()
+	m.createPRBase.SetValue(base)
+	m.createPRBase.Blur()
+
+	return m, textinput.Blink
+}
+
+func (m Model) updateCreatePR(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "esc":
+			m.state = stateNormal
+			m.inputErr = ""
+			m.createPRTitle.Blur()
+			m.createPRBase.Blur()
+			return m, nil
+
+		case "tab":
+			// Cycle: title → base → draft → title
+			switch m.createPRField {
+			case fieldTitle:
+				m.createPRField = fieldBase
+				m.createPRTitle.Blur()
+				m.createPRBase.Focus()
+			case fieldBase:
+				m.createPRField = fieldDraft
+				m.createPRBase.Blur()
+			case fieldDraft:
+				m.createPRField = fieldTitle
+				m.createPRTitle.Focus()
+			}
+			return m, textinput.Blink
+
+		case " ":
+			// Space toggles draft when focused on draft field.
+			if m.createPRField == fieldDraft {
+				m.createPRDraft = !m.createPRDraft
+				return m, nil
+			}
+
+		case "enter":
+			title := strings.TrimSpace(m.createPRTitle.Value())
+			base := strings.TrimSpace(m.createPRBase.Value())
+			if title == "" {
+				m.inputErr = "title cannot be empty"
+				return m, nil
+			}
+			if base == "" {
+				m.inputErr = "base branch cannot be empty"
+				return m, nil
+			}
+			s := m.selectedSession()
+			if s == nil {
+				m.inputErr = "no session selected"
+				return m, nil
+			}
+			m.inputErr = ""
+			m.createPRTitle.Blur()
+			m.createPRBase.Blur()
+			return m, createPRCmd(m.forge, s.Path, s.Branch, forge.CreateOpts{
+				Title:      title,
+				BaseBranch: base,
+				Draft:      m.createPRDraft,
+			})
+		}
+	}
+
+	var cmd tea.Cmd
+	switch m.createPRField {
+	case fieldTitle:
+		m.createPRTitle, cmd = m.createPRTitle.Update(msg)
+	case fieldBase:
+		m.createPRBase, cmd = m.createPRBase.Update(msg)
+	}
+	return m, cmd
+}
+
+func (m Model) updateManagePR(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "esc":
+			m.state = stateNormal
+			return m, nil
+		case "p":
+			// publish: mark ready for review
+			s := m.selectedSession()
+			if s == nil || s.PR == nil {
+				m.state = stateNormal
+				return m, nil
+			}
+			draft := false
+			return m, updatePRCmd(m.forge, s.PR.Number, forge.UpdateOpts{Draft: &draft})
+		case "d":
+			// convert to draft
+			s := m.selectedSession()
+			if s == nil || s.PR == nil {
+				m.state = stateNormal
+				return m, nil
+			}
+			draft := true
+			return m, updatePRCmd(m.forge, s.PR.Number, forge.UpdateOpts{Draft: &draft})
+		case "o":
+			s := m.selectedSession()
+			if s != nil && s.PR != nil && s.PR.WebURL != "" {
+				m.state = stateNormal
+				return m, openURLCmd(s.PR.WebURL)
+			}
+			m.state = stateNormal
+			return m, nil
+		}
+	}
+	return m, nil
 }
 
 func (m Model) updateNewSession(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -514,7 +816,6 @@ func (m Model) updateCommit(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "esc":
-			// step back to type selection
 			m.state = stateCommitType
 			m.inputErr = ""
 			m.nameInput.Blur()
@@ -575,7 +876,7 @@ func (m Model) View() string {
 	}
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, m.list.View(), m.renderDetail())
-	base := lipgloss.JoinVertical(lipgloss.Left, body, m.renderHelp())
+	base := lipgloss.JoinVertical(lipgloss.Left, body, m.renderStatus(), m.renderHelp())
 
 	switch m.state {
 	case stateNewSession:
@@ -586,6 +887,10 @@ func (m Model) View() string {
 		return m.renderCommitModalOver(base)
 	case stateDeleteConfirm:
 		return m.renderDeleteConfirmOver(base)
+	case stateCreatePR:
+		return m.renderCreatePRModalOver(base)
+	case stateManagePR:
+		return m.renderManagePRModalOver(base)
 	}
 	return base
 }
@@ -593,13 +898,13 @@ func (m Model) View() string {
 // — layout helpers ——————————————————————————————————————————————————————————
 
 func (m Model) listDimensions() (width, height int) {
-	return m.width / 3, m.height - 2
+	return m.width / 3, m.height - 3 // -3: status + help lines
 }
 
 func (m Model) renderDetail() string {
 	lw, _ := m.listDimensions()
 	dw := m.width - lw
-	dh := m.height - 2
+	dh := m.height - 3
 
 	style := lipgloss.NewStyle().
 		Border(lipgloss.NormalBorder(), false, false, false, true).
@@ -609,7 +914,6 @@ func (m Model) renderDetail() string {
 		Width(dw - 1).
 		Height(dh)
 
-	// Width of inner text area: box width minus padding
 	contentWidth := (dw - 1) - 3 - 2
 
 	s := m.selectedSession()
@@ -637,12 +941,15 @@ func (m Model) renderDetail() string {
 	b.WriteString(row("PATH     ", s.Path))
 	b.WriteString(row("STATUS   ", statusVal))
 	b.WriteString("\n")
-	b.WriteString(sectionSep("MR", contentWidth) + "\n\n")
+	b.WriteString(sectionSep("PR / MR", contentWidth) + "\n\n")
 
-	if s.MR != nil {
-		b.WriteString(renderMR(s.MR, contentWidth))
+	if s.PR != nil {
+		b.WriteString(renderPR(s.PR, contentWidth))
 	} else {
-		b.WriteString(dimStyle.Render("NO MR FOUND") + "\n")
+		b.WriteString(dimStyle.Render("NO PR FOUND") + "\n")
+		if m.forge != nil {
+			b.WriteString(dimStyle.Render("press m to create one") + "\n")
+		}
 	}
 
 	b.WriteString("\n")
@@ -664,23 +971,28 @@ func sectionSep(label string, width int) string {
 	return dimStyle.Render(content + strings.Repeat("─", remaining))
 }
 
-func renderMR(mr *model.MR, contentWidth int) string {
+func renderPR(pr *model.PR, contentWidth int) string {
 	var b strings.Builder
 
 	row := func(lbl, val string) string {
 		return labelStyle.Render(lbl) + val + "\n"
 	}
 
-	// Truncate title if it would overflow the content area
-	title := mr.Title
-	maxTitleLen := contentWidth - 9 // 9 = label column width
+	title := pr.Title
+	maxTitleLen := contentWidth - 9
 	if maxTitleLen > 0 && len([]rune(title)) > maxTitleLen {
 		title = string([]rune(title)[:maxTitleLen-1]) + "…"
 	}
 
-	inactive := mr.State == "merged" || mr.State == "closed"
+	inactive := pr.State == "merged" || pr.State == "closed"
 
-	b.WriteString(row("MR       ", fmt.Sprintf("!%d", mr.IID)))
+	// Prefix: GitLab uses "!", GitHub uses "#"
+	prefix := "!"
+	if pr.Forge == "github" {
+		prefix = "#"
+	}
+
+	b.WriteString(row("PR       ", fmt.Sprintf("%s%d", prefix, pr.Number)))
 	if inactive {
 		b.WriteString(dimStyle.Render("         "+title) + "\n")
 	} else {
@@ -688,21 +1000,24 @@ func renderMR(mr *model.MR, contentWidth int) string {
 	}
 
 	var stateStr string
-	switch mr.State {
+	switch pr.State {
 	case "merged":
 		stateStr = dimStyle.Render("MERGED")
 	case "closed":
 		stateStr = dimStyle.Render("CLOSED")
 	default:
-		stateStr = okStyle.Render("OPEN")
+		if pr.Draft {
+			stateStr = dimStyle.Render("DRAFT")
+		} else {
+			stateStr = okStyle.Render("OPEN")
+		}
 	}
 	b.WriteString(row("STATE    ", stateStr))
+	b.WriteString(row("PIPELINE ", pipelineLabel(pr.PipelineStatus)))
 
-	b.WriteString(row("PIPELINE ", pipelineLabel(mr.PipelineStatus)))
-
-	if mr.HasUnresolved {
+	if pr.HasUnresolved {
 		b.WriteString(row("THREADS  ", warnStyle.Render("▲ UNRESOLVED")))
-	} else if mr.PipelineStatus != "" {
+	} else if pr.PipelineStatus != "" {
 		b.WriteString(row("THREADS  ", okStyle.Render("◆ RESOLVED")))
 	}
 
@@ -730,6 +1045,20 @@ func pipelineLabel(status string) string {
 	}
 }
 
+func (m Model) renderStatus() string {
+	if m.statusText == "" {
+		return ""
+	}
+	switch m.statusLevel {
+	case statusWarn:
+		return statusWarnStyle.Render(m.statusText)
+	case statusError:
+		return statusErrStyle.Render(m.statusText)
+	default:
+		return statusInfoStyle.Render(m.statusText)
+	}
+}
+
 func (m Model) renderHelp() string {
 	var text string
 	switch m.state {
@@ -741,8 +1070,12 @@ func (m Model) renderHelp() string {
 		text = "Enter commit   Esc ← type"
 	case stateDeleteConfirm:
 		text = "y/Enter confirm   n/Esc cancel"
+	case stateCreatePR:
+		text = "Tab next field   Space toggle draft   Enter create   Esc cancel"
+	case stateManagePR:
+		text = "p publish   d draft   o open   Esc cancel"
 	default:
-		text = "↑/↓ navigate   Enter attach   n new   c commit   o open MR   d delete   r refresh   q quit"
+		text = "↑/↓ navigate   Enter attach   n new   c commit   p push   m MR/PR   o open   d delete   r refresh   q quit"
 	}
 	sep := dimStyle.Render(strings.Repeat("─", m.width))
 	return sep + "\n" + helpStyle.Render(text)
@@ -798,7 +1131,6 @@ func (m Model) renderCommitModalOver(base string) string {
 	if m.inputErr != "" {
 		b.WriteString("\n" + errStyle.Render(m.inputErr) + "\n")
 	}
-	// live preview of the final commit message
 	desc := m.nameInput.Value()
 	if desc == "" {
 		desc = dimStyle.Render("…")
@@ -818,10 +1150,10 @@ func (m Model) renderDeleteConfirmOver(base string) string {
 	if s != nil {
 		b.WriteString(labelStyle.Render("BRANCH   ") + s.Branch + "\n")
 		b.WriteString(labelStyle.Render("PATH     ") + s.Path + "\n\n")
-		if s.MR != nil && s.MR.State == "merged" {
-			b.WriteString(okStyle.Render("◆ MR merged — safe to clean up") + "\n\n")
-		} else if s.MR != nil && s.MR.State == "opened" {
-			b.WriteString(warnStyle.Render("▲ MR is still open") + "\n\n")
+		if s.PR != nil && s.PR.State == "merged" {
+			b.WriteString(okStyle.Render("◆ PR merged — safe to clean up") + "\n\n")
+		} else if s.PR != nil && s.PR.State == "open" {
+			b.WriteString(warnStyle.Render("▲ PR is still open") + "\n\n")
 		}
 	}
 	b.WriteString("This will run git worktree remove and delete the branch.\n")
@@ -836,6 +1168,99 @@ func (m Model) renderDeleteConfirmOver(base string) string {
 	)
 }
 
+func (m Model) renderCreatePRModalOver(base string) string {
+	s := m.selectedSession()
+	f := m.forge
+
+	var b strings.Builder
+	b.WriteString(detailHeadStyle.Render("CREATE PR / MR") + "\n\n")
+
+	if f != nil {
+		forgeLabel := "GitLab"
+		if f.Kind() == "github" {
+			forgeLabel = "GitHub"
+		}
+		b.WriteString(row("FORGE  ", dimStyle.Render(forgeLabel)))
+	}
+	if s != nil {
+		b.WriteString(row("BRANCH ", dimStyle.Render(s.Branch)))
+	}
+	b.WriteString("\n")
+
+	// Title field
+	titleLabel := labelStyle.Render("TITLE")
+	if m.createPRField == fieldTitle {
+		titleLabel = boldStyle.Foreground(lipgloss.Color("86")).Render("TITLE")
+	}
+	b.WriteString(titleLabel + "\n")
+	b.WriteString(m.createPRTitle.View() + "\n\n")
+
+	// Base field
+	baseLabel := labelStyle.Render("BASE")
+	if m.createPRField == fieldBase {
+		baseLabel = boldStyle.Foreground(lipgloss.Color("86")).Render("BASE")
+	}
+	b.WriteString(baseLabel + "\n")
+	b.WriteString(m.createPRBase.View() + "\n\n")
+
+	// Draft toggle
+	draftLabel := labelStyle.Render("DRAFT")
+	if m.createPRField == fieldDraft {
+		draftLabel = boldStyle.Foreground(lipgloss.Color("86")).Render("DRAFT")
+	}
+	draftVal := "[ ] No"
+	if m.createPRDraft {
+		draftVal = okStyle.Render("[x] Yes")
+	}
+	b.WriteString(draftLabel + "  " + draftVal + "\n")
+
+	if m.inputErr != "" {
+		b.WriteString("\n" + errStyle.Render(m.inputErr) + "\n")
+	}
+
+	modal := modalStyle.Render(b.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal,
+		lipgloss.WithWhitespaceBackground(lipgloss.Color("0")),
+	)
+}
+
+func (m Model) renderManagePRModalOver(base string) string {
+	s := m.selectedSession()
+	var b strings.Builder
+	b.WriteString(detailHeadStyle.Render("MANAGE PR / MR") + "\n\n")
+
+	if s != nil && s.PR != nil {
+		prefix := "!"
+		if s.PR.Forge == "github" {
+			prefix = "#"
+		}
+		b.WriteString(dimStyle.Render(fmt.Sprintf("%s%d · %s", prefix, s.PR.Number, s.PR.Title)) + "\n\n")
+
+		if s.PR.Draft {
+			b.WriteString(fmt.Sprintf("  %s  %s\n",
+				okStyle.Render("p"),
+				"publish  "+dimStyle.Render("mark ready for review"),
+			))
+		} else {
+			b.WriteString(fmt.Sprintf("  %s  %s\n",
+				warnStyle.Render("d"),
+				"draft    "+dimStyle.Render("convert to draft"),
+			))
+		}
+	}
+
+	b.WriteString(fmt.Sprintf("  %s  %s\n",
+		okStyle.Render("o"),
+		"open     "+dimStyle.Render("open in browser"),
+	))
+	b.WriteString("\n" + dimStyle.Render("Esc cancel"))
+
+	modal := modalStyle.Render(b.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal,
+		lipgloss.WithWhitespaceBackground(lipgloss.Color("0")),
+	)
+}
+
 func (m Model) selectedSession() *model.Session {
 	if len(m.sessions) == 0 {
 		return nil
@@ -845,4 +1270,23 @@ func (m Model) selectedSession() *model.Session {
 		return nil
 	}
 	return &m.sessions[idx]
+}
+
+// slugToTitle converts a branch name to a human-readable title.
+// e.g. "feat/user-auth-flow" → "feat: user auth flow"
+func slugToTitle(branch string) string {
+	// strip common prefixes like "feat/", "fix/", etc.
+	parts := strings.SplitN(branch, "/", 2)
+	var slug string
+	if len(parts) == 2 {
+		slug = parts[0] + ": " + parts[1]
+	} else {
+		slug = parts[0]
+	}
+	return strings.ReplaceAll(slug, "-", " ")
+}
+
+// row is a local helper for the create PR modal.
+func row(lbl, val string) string {
+	return labelStyle.Render(lbl) + val + "\n"
 }

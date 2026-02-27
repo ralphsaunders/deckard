@@ -100,6 +100,29 @@ func DeleteWorktree(repoRoot, path, branch string) error {
 	return nil
 }
 
+// HasUpstream reports whether the given branch has a configured upstream remote ref.
+func HasUpstream(repoPath, branch string) bool {
+	err := exec.Command(
+		"git", "-C", repoPath,
+		"rev-parse", "--abbrev-ref", "--symbolic-full-name",
+		branch+"@{upstream}",
+	).Run()
+	return err == nil
+}
+
+// Push pushes branch to origin, setting upstream if not already set.
+func Push(repoPath, branch string) error {
+	args := []string{"-C", repoPath, "push"}
+	if !HasUpstream(repoPath, branch) {
+		args = append(args, "--set-upstream", "origin", branch)
+	}
+	out, err := exec.Command("git", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // BranchToSlug normalises a branch name into a filesystem/tmux-safe slug.
 func BranchToSlug(branch string) string {
 	if branch == "" {

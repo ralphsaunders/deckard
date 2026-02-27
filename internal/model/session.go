@@ -1,13 +1,15 @@
 package model
 
-// MR holds GitLab merge request metadata fetched via glab.
-type MR struct {
-	IID            int
+// PR holds pull/merge request metadata fetched via gh or glab.
+type PR struct {
+	Number         int    // GitLab IID or GitHub PR number
 	Title          string
 	WebURL         string
-	State          string // "opened", "merged", "closed"
+	State          string // "open", "merged", "closed"
 	PipelineStatus string // "success", "failed", "running", "pending", "canceled", etc.
-	HasUnresolved  bool   // true if blocking discussions are unresolved
+	HasUnresolved  bool   // true if blocking discussions / review requests unresolved
+	Draft          bool
+	Forge          string // "gitlab" | "github"
 }
 
 // Session represents a git worktree and its associated work context.
@@ -17,5 +19,5 @@ type Session struct {
 	Slug        string // normalised task name, e.g. "JIRA-182-payment-retries"
 	NeedsInput  bool
 	TmuxRunning bool // whether a live tmux session exists for this worktree
-	MR          *MR  // nil if no MR found or glab unavailable
+	PR          *PR  // nil if no PR found or forge CLI unavailable
 }
