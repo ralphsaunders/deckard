@@ -45,7 +45,13 @@ func configPath() (string, error) {
 	}
 	const conf = "# Deckard tmux config — do not edit manually\n" +
 		"# Ctrl+] returns you to the Deckard dashboard without stopping Claude\n" +
-		"bind-key -n C-] detach-client\n"
+		"bind-key -n C-] detach-client\n" +
+		"set -g status on\n" +
+		"set -g status-style \"fg=colour240,bg=colour234\"\n" +
+		"set -g status-left \"\"\n" +
+		"set -g status-right \"#[fg=colour86]ctrl+]#[fg=colour240]  return to deckard\"\n" +
+		"set -g status-right-length 30\n" +
+		"set -g status-justify left\n"
 	if err := os.WriteFile(p, []byte(conf), 0644); err != nil {
 		return "", fmt.Errorf("write config: %w", err)
 	}
