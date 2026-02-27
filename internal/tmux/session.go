@@ -45,7 +45,10 @@ func configPath() (string, error) {
 	}
 	const conf = "# Deckard tmux config — do not edit manually\n" +
 		"# Ctrl+] returns you to the Deckard dashboard without stopping Claude\n" +
-		"bind-key -n C-] detach-client\n"
+		"bind-key -n C-] detach-client\n" +
+		"# Mouse wheel / PageUp enters scroll mode so you can read long plans\n" +
+		"set -g mouse on\n" +
+		"bind-key -n PageUp copy-mode\n"
 	if err := os.WriteFile(p, []byte(conf), 0644); err != nil {
 		return "", fmt.Errorf("write config: %w", err)
 	}
