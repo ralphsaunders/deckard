@@ -8,7 +8,7 @@ build:
 	go build $(BUILD_FLAGS) -o $(BINARY) .
 
 dev:
-	air
+	$(shell go env GOPATH)/bin/air
 
 install: build
 	mkdir -p $(INSTALL_DIR)
