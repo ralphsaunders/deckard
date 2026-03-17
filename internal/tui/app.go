@@ -17,7 +17,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"deckard/internal/git"
-	"deckard/internal/gitlab"
+	"deckard/internal/gitcloud"
 	"deckard/internal/model"
 	"deckard/internal/status"
 	"deckard/internal/tmux"
@@ -147,6 +147,7 @@ type Model struct {
 	loading  bool
 	err      error
 	repoRoot string
+	provider gitcloud.Provider
 
 	state        appState
 	nameInput    textinput.Model
@@ -188,19 +189,20 @@ func New() Model {
 		repoRoot:  root,
 		loading:   true,
 		nameInput: ti,
+		provider:  gitcloud.Detect(),
 	}
 }
 
 // — commands ————————————————————————————————————————————————————————————————
 
-func fetchSessionsCmd(repoRoot string) tea.Cmd {
+func fetchSessionsCmd(repoRoot string, provider gitcloud.Provider) tea.Cmd {
 	return func() tea.Msg {
 		sessions, err := git.ListWorktrees()
 		if err != nil {
 			return sessionsLoadedMsg{sessions: nil, err: err}
 		}
 
-		// Enrich sessions concurrently: tmux status, GitLab MR data, agent status.
+		// Enrich sessions concurrently: tmux status, git cloud MR data, agent status.
 		var wg sync.WaitGroup
 		for i := range sessions {
 			wg.Add(1)
@@ -210,7 +212,7 @@ func fetchSessionsCmd(repoRoot string) tea.Cmd {
 				if sessions[i].TmuxRunning {
 					sessions[i].NeedsInput = tmux.NeedsInput(sessions[i].Slug)
 				}
-				mr, _ := gitlab.FetchMR(sessions[i].Branch)
+				mr, _ := provider.FetchMR(sessions[i].Branch)
 				sessions[i].MR = mr
 				agentStatus, _ := status.Read(repoRoot, sessions[i].Slug)
 				sessions[i].AgentStatus = agentStatus
@@ -223,43 +225,43 @@ func fetchSessionsCmd(repoRoot string) tea.Cmd {
 	}
 }
 
-// computeNeedsInput determines whether a session needs human input, preferring
-// the explicit agent status file over inferred signals.
+// computeNeedsInput determines whether a session needs human input based
+// exclusively on the explicit agent status file. MR signals (CI failures,
+// unresolved threads) do not surface sessions — the agent is responsible
+// for resolving those before writing needs_review.
+//
+// needs_review without an mr_url is treated as blocked: the agent surfaced
+// prematurely without raising an MR first.
 func computeNeedsInput(s model.Session) (bool, model.InputReason) {
-	if s.AgentStatus != nil {
-		switch s.AgentStatus.Status {
-		case "needs_review":
-			return true, model.InputReasonReviewReady
-		case "blocked":
-			return true, model.InputReasonBlocked
-		}
+	if s.AgentStatus == nil {
 		return false, model.InputReasonNone
 	}
-	// fallback: infer from MR signals and tmux idle detection
-	if s.MR != nil && (s.MR.PipelineStatus == "failed" || s.MR.HasUnresolved) {
-		return true, model.InputReasonInferred
-	}
-	if s.NeedsInput {
-		return true, model.InputReasonInferred
+	switch s.AgentStatus.Status {
+	case "needs_review":
+		if s.AgentStatus.MRURL == "" {
+			// Agent wrote needs_review without an MR — treat as blocked.
+			return true, model.InputReasonBlocked
+		}
+		return true, model.InputReasonReviewReady
+	case "blocked":
+		return true, model.InputReasonBlocked
 	}
 	return false, model.InputReasonNone
 }
 
 // sessionSortKey returns a sort priority: blocked first, then review-ready,
-// then inferred/active, then idle.
+// then active, then idle.
 func sessionSortKey(s model.Session) int {
 	switch s.InputReason {
 	case model.InputReasonBlocked:
 		return 0
 	case model.InputReasonReviewReady:
 		return 1
-	case model.InputReasonInferred:
-		return 2
 	}
 	if s.TmuxRunning {
-		return 3
+		return 2
 	}
-	return 4
+	return 3
 }
 
 func createWorktreeCmd(repoRoot, branch string) tea.Cmd {
@@ -344,7 +346,7 @@ func deleteWorktreeCmd(repoRoot, path, branch string) tea.Cmd {
 // — tea.Model ———————————————————————————————————————————————————————————————
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(fetchSessionsCmd(m.repoRoot), tickCmd())
+	return tea.Batch(fetchSessionsCmd(m.repoRoot, m.provider), tickCmd())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -401,7 +403,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Claude exited — refresh the session list and return to the overview.
 		m.state = stateNormal
 		m.loading = true
-		return m, fetchSessionsCmd(m.repoRoot)
+		return m, fetchSessionsCmd(m.repoRoot, m.provider)
 
 	case worktreeRemovedMsg:
 		if msg.err != nil {
@@ -412,7 +414,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = stateNormal
 		m.inputErr = ""
 		m.loading = true
-		return m, fetchSessionsCmd(m.repoRoot)
+		return m, fetchSessionsCmd(m.repoRoot, m.provider)
 	}
 
 	switch m.state {
@@ -435,7 +437,7 @@ func (m Model) updateNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "r":
 			m.loading = true
-			return m, fetchSessionsCmd(m.repoRoot)
+			return m, fetchSessionsCmd(m.repoRoot, m.provider)
 		case "n":
 			m.state = stateNewSession
 			m.inputErr = ""
@@ -482,15 +484,20 @@ func (m Model) updateReview(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.state = stateNormal
 			return m, nil
 		case "enter":
+			// Attach is only available for blocked sessions.
 			s := m.selectedSession()
-			if s != nil {
+			if s != nil && s.InputReason == model.InputReasonBlocked {
 				return m, ensureAndAttachCmd(*s)
 			}
 			return m, nil
 		case "o":
 			s := m.selectedSession()
-			if s != nil && s.MR != nil && s.MR.WebURL != "" {
-				return m, openURLCmd(s.MR.WebURL)
+			// Prefer agent-written MR URL; fall back to fetched MR.
+			if s != nil {
+				url := mrURL(s)
+				if url != "" {
+					return m, openURLCmd(url)
+				}
 			}
 			return m, nil
 		case "s":
@@ -502,6 +509,17 @@ func (m Model) updateReview(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// mrURL returns the best MR/PR URL for the session: agent-written first, then fetched.
+func mrURL(s *model.Session) string {
+	if s.AgentStatus != nil && s.AgentStatus.MRURL != "" {
+		return s.AgentStatus.MRURL
+	}
+	if s.MR != nil {
+		return s.MR.WebURL
+	}
+	return ""
 }
 
 func (m Model) updateNewSession(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -622,9 +640,7 @@ func (m Model) renderDetail() string {
 	case model.InputReasonBlocked:
 		statusVal = errStyle.Render("✕ BLOCKED")
 	default:
-		if s.NeedsInput {
-			statusVal = warnStyle.Render("▲ INPUT REQ")
-		} else if s.TmuxRunning {
+		if s.TmuxRunning {
 			statusVal = okStyle.Render("◆ ACTIVE")
 		} else {
 			statusVal = dimStyle.Render("· IDLE")
@@ -701,19 +717,26 @@ func (m Model) renderReview() string {
 		b.WriteString("\n")
 	}
 
-	// MR section
-	b.WriteString(sectionSep("MR", contentWidth) + "\n\n")
-	if s.MR != nil {
-		b.WriteString(renderMR(s.MR, contentWidth))
-		if s.MR.Description != "" {
-			b.WriteString("\n")
-			b.WriteString(sectionSep("DESCRIPTION", contentWidth) + "\n\n")
+	// For needs_review: render MR description inline as primary content.
+	// For blocked: the blockers list above is the primary content.
+	if s.InputReason == model.InputReasonReviewReady {
+		b.WriteString(sectionSep("MR DESCRIPTION", contentWidth) + "\n\n")
+		if s.MR != nil && s.MR.Description != "" {
 			for _, line := range strings.Split(wrapText(s.MR.Description, contentWidth-2), "\n") {
 				b.WriteString("  " + line + "\n")
 			}
+		} else if as.MRURL != "" {
+			b.WriteString(dimStyle.Render("  "+as.MRURL) + "\n")
+		} else {
+			b.WriteString(dimStyle.Render("  NO MR DESCRIPTION") + "\n")
 		}
-	} else {
-		b.WriteString(dimStyle.Render("  NO MR FOUND") + "\n")
+		b.WriteString("\n")
+	}
+
+	// MR metadata (always show if available)
+	if s.MR != nil {
+		b.WriteString(sectionSep("MR", contentWidth) + "\n\n")
+		b.WriteString(renderMR(s.MR, contentWidth))
 	}
 
 	body := lipgloss.NewStyle().Padding(1, 4).Width(m.width).Render(b.String())
@@ -871,7 +894,12 @@ func (m Model) renderHelp() string {
 	case stateDeleteConfirm:
 		text = "y/Enter confirm   n/Esc cancel"
 	case stateReview:
-		text = "Enter attach · o open MR · s encode skill · Esc back"
+		s := m.selectedSession()
+		if s != nil && s.InputReason == model.InputReasonBlocked {
+			text = "Enter attach · o open MR · s encode skill · Esc back"
+		} else {
+			text = "o open MR · s encode skill · Esc back"
+		}
 	default:
 		text = "↑/↓ navigate   Enter attach   n new   o open MR   d delete   q quit"
 	}

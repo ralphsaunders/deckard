@@ -15,6 +15,7 @@ type MR struct {
 type AgentStatus struct {
 	Status      string   // "working", "needs_review", "blocked"
 	Summary     string
+	MRURL       string   // MR URL written by agent; needs_review without this degrades to blocked
 	Uncertainty []string
 	Blockers    []string
 }
@@ -24,9 +25,8 @@ type InputReason int
 
 const (
 	InputReasonNone        InputReason = iota
-	InputReasonReviewReady             // status: needs_review — agent signalled ready for review
-	InputReasonBlocked                 // status: blocked — agent cannot proceed
-	InputReasonInferred                // inferred from tmux idle + MR signals
+	InputReasonReviewReady             // status: needs_review with mr_url — agent signalled ready for review
+	InputReasonBlocked                 // status: blocked (or needs_review without mr_url)
 )
 
 // Session represents a git worktree and its associated work context.

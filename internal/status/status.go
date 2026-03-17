@@ -71,6 +71,8 @@ func parseFrontmatter(content string) (*model.AgentStatus, error) {
 			result.Status = val
 		case "summary":
 			result.Summary = val
+		case "mr_url":
+			result.MRURL = val
 		case "uncertainty":
 			currentList = &result.Uncertainty
 		case "blockers":

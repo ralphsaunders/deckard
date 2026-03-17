@@ -1,4 +1,4 @@
-package gitlab
+package gitcloud
 
 import (
 	"context"
@@ -10,23 +10,24 @@ import (
 	"deckard/internal/model"
 )
 
+// GitLabProvider fetches MR data via the glab CLI.
+type GitLabProvider struct{}
+
 // glabMR mirrors the fields we care about from glab's JSON output.
 type glabMR struct {
 	IID    int    `json:"iid"`
 	Title  string `json:"title"`
 	State  string `json:"state"`
 	WebURL string `json:"web_url"`
-	// glab mr list includes the latest pipeline for the branch
 	Pipeline *struct {
 		Status string `json:"status"`
 	} `json:"pipeline"`
-	// set to false when there are open blocking discussion threads
 	BlockingDiscussionsResolved *bool `json:"blocking_discussions_resolved"`
 }
 
 // FetchMR returns the most relevant MR for the given branch using the glab CLI.
 // Returns (nil, nil) if glab is unavailable, not a GitLab repo, or no MR exists.
-func FetchMR(branch string) (*model.MR, error) {
+func (p *GitLabProvider) FetchMR(branch string) (*model.MR, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 

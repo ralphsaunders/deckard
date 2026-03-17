@@ -5,204 +5,160 @@ Claude Code makes it easy to spin up parallel coding sessions using Git worktree
 But once you have more than a few running, the workflow breaks down:
 
 * You lose track of how many sessions exist
-* You don’t know which ones need input
-* MRs and CI failures get missed
+* You don't know which ones need input
+* You waste time switching into sessions that aren't ready
 * Terminal tabs multiply
 * Finished worktrees linger after merge
 
-There’s no single place to see:
+There's no single place to see:
 
-> What’s in flight?
-> What’s blocked?
-> What needs me right now?
+> What's in flight? What's blocked? What needs me right now?
 
 ---
 
-## The Solution
+## The Vision
 
-Deckard acts as a command center for your worktree fleet.
+Deckard is a **coordinator's dashboard**, not an IC tool.
 
-It:
+The agent does the work. The agent raises the MR. The agent writes a
+`status.md` when done. **The MR is the terminal artefact** — the human
+reviews and merges the MR description, not a half-finished tmux session.
 
-* Discovers active Git worktrees
-* Maps them to Claude sessions (1:1 convention)
-* Links branches → MRs → pipelines
-* Flags work needing attention
-* Lets you jump directly into the right session
+The human's role is:
+1. Spin up sessions (new worktree → Claude attaches automatically)
+2. Glance at the dashboard to see what's ready or blocked
+3. Review and merge MRs
+4. Unblock agents when they hit genuine human-only decisions
 
-Think **lazygit**, but purpose-built for AI coding sessions.
+Deckard enables this loop at fleet scale.
+
+---
+
+## How the Loop Works
+
+1. **Agent completes work** → raises an MR via `/mr` skill
+2. **Agent writes `status: needs_review` + `mr_url`** in `status.md`
+3. **Deckard surfaces the session** as review-ready (▲)
+4. **Human opens review screen** → sees MR description inline
+5. **Human presses `o`** → MR opens in browser for review/merge
+6. **Human presses `d`** → clean up the worktree after merge
+
+For blocked sessions:
+1. **Agent writes `status: blocked`** with clear blockers
+2. **Deckard surfaces the session** as blocked (✕), sorted first
+3. **Human presses Enter** → attaches to Claude session to unblock
 
 ---
 
 ## MVP Scope
 
-The goal of the MVP is simple:
-
-> Replace “a million terminal tabs” with one operational dashboard.
+> Replace "a million terminal tabs" with one operational dashboard.
 
 ### 1) Worktree Discovery
 
-Deckard will:
-
-* Parse `git worktree list --porcelain`
-* Treat each worktree as an active “unit”
-* Infer task names from branch/worktree names
-
-Output example:
-
-```
-JIRA-182-payment-retries
-JIRA-201-klarna-webhooks
-chore-jest-upgrade
-perf-plp-hydration
-```
-
----
+Deckard parses `git worktree list --porcelain` and treats each worktree
+as an active unit. Task names are inferred from branch/worktree slugs.
 
 ### 2) Session Mapping (Convention-based)
 
-MVP assumes:
+One Claude tmux session per worktree; session name matches the slug.
 
-* One Claude session per worktree
-* Session name matches worktree/branch slug
+### 3) Status-driven Attention
 
-Future versions may read Claude’s session store directly.
+Sessions surface to the human based **only** on explicit `status.md` signals:
 
----
+- `needs_review` + `mr_url` → sorted second (▲ READY FOR REVIEW)
+- `needs_review` without `mr_url` → sorted first (✕ BLOCKED — agent surfaced prematurely)
+- `blocked` → sorted first (✕ BLOCKED)
 
-### 3) GitLab MR Linking
+CI failures, unresolved threads, and tmux idle detection do **not** surface
+sessions. Those are agent problems to solve.
 
-Using `glab` CLI, Deckard will:
+### 4) Git Cloud Integration
 
-* Find open MRs for each branch
-* Display MR ID + title
-* Provide quick-open in browser
+Deckard auto-detects the git hosting provider:
 
----
+- **GitLab**: uses `glab` CLI to fetch MR metadata and description
+- **GitHub**: uses `gh` CLI to fetch PR metadata and description
+- **No provider**: dashboard still works; MR fields show as empty
 
-### 4) CI Status Monitoring
+MR data enriches the dashboard and review screen. Deckard does not create
+MRs — that is the agent's responsibility.
 
-Deckard will pull pipeline status:
+### 5) Review Screen
 
-* ✅ Passed
-* ❌ Failed
-* ⏳ Running
+When a session is selected and has agent status:
 
-Failures will flag the session as needing attention.
+**For `needs_review`:** shows summary + MR description inline; `o` opens
+the MR for review/merge. `Enter` (attach to Claude) is not offered — the
+work is done.
 
----
-
-### 5) “Needs Input” Detection
-
-A session gets an `*` if:
-
-* MR has unresolved threads
-* Pipeline failed
-* (Future) Claude requested input via notifications
-
-Example list:
-
-```
-*JIRA-182-payment-retries
-JIRA-201-klarna-webhooks
-*chore-jest-upgrade
-perf-plp-hydration
-```
-
----
+**For `blocked`:** shows summary + blockers; `Enter` attaches to the Claude
+session. `o` opens the MR if one exists.
 
 ### 6) Split-Pane TUI
 
-Layout:
-
 ```
 ┌─────────────────────────┬────────────────────────────┐
-│ Worktrees               │ Deckard Scan Report        │
+│ WORKTREES               │ JIRA-182-PAYMENT-RETRIES   │
 │                         │                            │
-│ *JIRA-182 …             │ MR: !4821                  │
-│ JIRA-201 …              │ Pipeline: Failed           │
-│ *chore-jest …           │ Last activity: 2h          │
-│ perf-plp …              │ Attention: Review comment  │
-│                         │                            │
+│ ✕ JIRA-182 …            │ BRANCH   feat/JIRA-182     │
+│ ▲ JIRA-201 …            │ STATUS   ✕ BLOCKED         │
+│ / chore-jest …          │                            │
+│ · perf-plp …            │ ─── MR ─────────────────── │
+│                         │ MR       !4821              │
+│                         │ STATE    OPEN               │
+│                         │ PIPELINE ◆ PASSED           │
 └─────────────────────────┴────────────────────────────┘
+↑/↓ navigate  Enter attach  n new  o open MR  d delete  r refresh  q quit
 ```
-
-Navigation:
-
-* ↑ ↓ → select session
-* Enter/Space → resume session
-* `o` → open MR
-* `?` → filter
-
----
 
 ### 7) Session Resume
 
-Deckard will:
-
-* Launch `claude --resume <session>`
-* Attach to the same terminal
-* Return to Deckard UI when Claude exits
-
-No new tabs required.
-
----
+Deckard launches `tmux attach` for the session's window. Returns to the
+dashboard when the user detaches.
 
 ### 8) Worktree Cleanup (Manual)
 
-Deckard can:
-
-* Detect merged MRs
-* Offer to delete associated worktrees
-
-Future: auto-retire on merge via GitLab events.
+`d` deletes the worktree and branch. Shows a warning if the MR is still open;
+confirms that it's safe to clean up if the MR is merged.
 
 ---
 
 ## Non-Goals (for MVP)
 
-To avoid overbuilding, MVP will NOT include:
-
-* Direct Claude session store parsing
-* Background daemons
-* Webhooks / event listeners
+* Human-initiated commits (the agent commits)
+* Surfacing sessions based on CI failures or unresolved threads
+* Background daemons or webhooks
 * Jira integration
 * CI log parsing
 * Multi-repo aggregation
 
-Those can come later if useful.
-
 ---
 
-## Tech Stack (Planned)
+## Tech Stack
 
 * **Go** — single static binary
 * **Bubble Tea** — TUI framework
 * **Bubbles** — list + viewport components
 * **Lip Gloss** — styling/layout
-* Shell integrations:
-
-  * `git`
-  * `glab`
-  * `claude`
+* Shell integrations: `git`, `glab` or `gh`, `tmux`
 
 ---
 
 ## Design Principles
 
-* Worktree-first, not AI-first
+* Coordinator-first: the agent does the IC work, the human reviews outcomes
+* Status-driven: only explicit `status.md` signals pull human attention
+* MR as terminal artefact: `needs_review` means there is an MR to review
 * Local-first, no external services
 * Convention over configuration
-* Fast to open, fast to navigate
-* Zero tab sprawl
 
 ---
 
 ## Future Ideas
 
 * Auto-retire worktrees on MR merge
-* Claude notification ingestion
-* Jira ticket linking via MCP
-* CI failure log summarisation
-* Multi-repo “fleet view”
-* Agent auto-retry on pipeline failure
+* Skill encoding flow triggered from review screen
+* Multi-repo "fleet view"
+* Agent auto-retry on pipeline failure with context from CI logs
