@@ -3,6 +3,7 @@ package gitlab
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os/exec"
 	"time"
 
@@ -69,6 +70,21 @@ func FetchMR(branch string) (*model.MR, error) {
 	}
 	if found.BlockingDiscussionsResolved != nil {
 		mr.HasUnresolved = !*found.BlockingDiscussionsResolved
+	}
+
+	// Fetch full description via a second glab call.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+	viewOut, viewErr := exec.CommandContext(ctx2,
+		"glab", "mr", "view", fmt.Sprintf("%d", mr.IID), "--output", "json",
+	).Output()
+	if viewErr == nil {
+		var detail struct {
+			Description string `json:"description"`
+		}
+		if json.Unmarshal(viewOut, &detail) == nil {
+			mr.Description = detail.Description
+		}
 	}
 
 	return mr, nil
