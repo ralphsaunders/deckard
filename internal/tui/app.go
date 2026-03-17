@@ -30,30 +30,9 @@ type appState int
 const (
 	stateNormal appState = iota
 	stateNewSession
-	stateCommitType
-	stateCommit
 	stateDeleteConfirm
 	stateReview
 )
-
-// — conventional commit types ————————————————————————————————————————————————
-
-type ccType struct {
-	key   string
-	typ   string
-	label string
-}
-
-var commitTypes = []ccType{
-	{"f", "feat", "new feature"},
-	{"x", "fix", "bug fix"},
-	{"r", "refactor", "code restructure"},
-	{"d", "docs", "documentation"},
-	{"t", "test", "tests"},
-	{"c", "chore", "maintenance"},
-	{"i", "ci", "CI/CD"},
-	{"p", "perf", "performance"},
-}
 
 // — styles ——————————————————————————————————————————————————————————————————
 
@@ -129,10 +108,6 @@ type claudeExitedMsg struct {
 	err error
 }
 
-type commitResultMsg struct {
-	err error
-}
-
 type worktreeRemovedMsg struct {
 	err error
 }
@@ -177,7 +152,6 @@ type Model struct {
 	nameInput    textinput.Model
 	inputErr     string
 	spinnerFrame int
-	commitType   string
 }
 
 func New() Model {
@@ -334,22 +308,6 @@ func encodeSkillCmd(repoRoot string, s model.Session) tea.Cmd {
 	}
 }
 
-func commitCmd(path, message string) tea.Cmd {
-	return func() tea.Msg {
-		add := exec.Command("git", "-C", path, "add", "-A")
-		if out, err := add.CombinedOutput(); err != nil {
-			return commitResultMsg{err: fmt.Errorf("git add: %s", strings.TrimSpace(string(out)))}
-		}
-		commit := exec.Command("git", "-C", path, "commit", "-m", message)
-		out, err := commit.CombinedOutput()
-		if err != nil {
-			return commitResultMsg{err: fmt.Errorf("%s", strings.TrimSpace(string(out)))}
-		}
-		_ = out
-		return commitResultMsg{}
-	}
-}
-
 // buildItems rebuilds the list items with the current spinner frame.
 func (m *Model) buildItems() {
 	char := spinnerFrames[m.spinnerFrame]
@@ -445,18 +403,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = true
 		return m, fetchSessionsCmd(m.repoRoot)
 
-	case commitResultMsg:
-		if msg.err != nil {
-			m.inputErr = msg.err.Error()
-			return m, nil
-		}
-		m.state = stateNormal
-		m.inputErr = ""
-		m.nameInput.Reset()
-		m.nameInput.Blur()
-		m.loading = true
-		return m, fetchSessionsCmd(m.repoRoot)
-
 	case worktreeRemovedMsg:
 		if msg.err != nil {
 			m.inputErr = msg.err.Error()
@@ -472,10 +418,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.state {
 	case stateNewSession:
 		return m.updateNewSession(msg)
-	case stateCommitType:
-		return m.updateCommitType(msg)
-	case stateCommit:
-		return m.updateCommit(msg)
 	case stateDeleteConfirm:
 		return m.updateDeleteConfirm(msg)
 	case stateReview:
@@ -501,15 +443,6 @@ func (m Model) updateNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.nameInput.Reset()
 			m.nameInput.Focus()
 			return m, textinput.Blink
-		case "c":
-			s := m.selectedSession()
-			if s != nil {
-				m.state = stateCommitType
-				m.commitType = ""
-				m.inputErr = ""
-				return m, nil
-			}
-			return m, nil
 		case "o":
 			s := m.selectedSession()
 			if s != nil && s.MR != nil && s.MR.WebURL != "" {
@@ -599,60 +532,6 @@ func (m Model) updateNewSession(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m Model) updateCommitType(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "esc":
-			m.state = stateNormal
-			m.inputErr = ""
-			return m, nil
-		}
-		for _, t := range commitTypes {
-			if msg.String() == t.key {
-				m.commitType = t.typ
-				m.state = stateCommit
-				m.inputErr = ""
-				m.nameInput.Placeholder = "short description"
-				m.nameInput.Reset()
-				m.nameInput.Focus()
-				return m, textinput.Blink
-			}
-		}
-	}
-	return m, nil
-}
-
-func (m Model) updateCommit(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "esc":
-			// step back to type selection
-			m.state = stateCommitType
-			m.inputErr = ""
-			m.nameInput.Blur()
-			return m, nil
-		case "enter":
-			desc := strings.TrimSpace(m.nameInput.Value())
-			if desc == "" {
-				m.inputErr = "description cannot be empty"
-				return m, nil
-			}
-			s := m.selectedSession()
-			if s == nil {
-				m.inputErr = "no session selected"
-				return m, nil
-			}
-			m.inputErr = ""
-			return m, commitCmd(s.Path, m.commitType+": "+desc)
-		}
-	}
-	var cmd tea.Cmd
-	m.nameInput, cmd = m.nameInput.Update(msg)
-	return m, cmd
-}
-
 func (m Model) updateDeleteConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -699,10 +578,6 @@ func (m Model) View() string {
 	switch m.state {
 	case stateNewSession:
 		return m.renderModalOver(base)
-	case stateCommitType:
-		return m.renderCommitTypeModalOver(base)
-	case stateCommit:
-		return m.renderCommitModalOver(base)
 	case stateDeleteConfirm:
 		return m.renderDeleteConfirmOver(base)
 	}
@@ -993,16 +868,12 @@ func (m Model) renderHelp() string {
 	switch m.state {
 	case stateNewSession:
 		text = "Enter create   Esc cancel"
-	case stateCommitType:
-		text = "key select type   Esc cancel"
-	case stateCommit:
-		text = "Enter commit   Esc ← type"
 	case stateDeleteConfirm:
 		text = "y/Enter confirm   n/Esc cancel"
 	case stateReview:
 		text = "Enter attach · o open MR · s encode skill · Esc back"
 	default:
-		text = "↑/↓ navigate   Enter attach   n new   c commit   o open MR   d delete   q quit"
+		text = "↑/↓ navigate   Enter attach   n new   o open MR   d delete   q quit"
 	}
 	sep := dimStyle.Render(strings.Repeat("─", m.width))
 	return sep + "\n" + helpStyle.Render(text)
@@ -1017,53 +888,6 @@ func (m Model) renderModalOver(base string) string {
 		b.WriteString("\n" + errStyle.Render(m.inputErr) + "\n")
 	}
 	b.WriteString("\n" + dimStyle.Render("creates .claude/worktrees/<slug> · opens claude"))
-
-	modal := modalStyle.Render(b.String())
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal,
-		lipgloss.WithWhitespaceBackground(lipgloss.Color("0")),
-	)
-}
-
-func (m Model) renderCommitTypeModalOver(base string) string {
-	s := m.selectedSession()
-	var b strings.Builder
-	b.WriteString(detailHeadStyle.Render("COMMIT TYPE") + "\n\n")
-	if s != nil {
-		b.WriteString(dimStyle.Render(strings.ToUpper(s.Slug)) + "\n\n")
-	}
-	for _, t := range commitTypes {
-		b.WriteString(fmt.Sprintf("  %s  %-10s  %s\n",
-			okStyle.Render(t.key),
-			boldStyle.Render(t.typ),
-			dimStyle.Render(t.label),
-		))
-	}
-
-	modal := modalStyle.Render(b.String())
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal,
-		lipgloss.WithWhitespaceBackground(lipgloss.Color("0")),
-	)
-}
-
-func (m Model) renderCommitModalOver(base string) string {
-	s := m.selectedSession()
-	var b strings.Builder
-	b.WriteString(detailHeadStyle.Render("COMMIT CHANGES") + "\n\n")
-	if s != nil {
-		b.WriteString(dimStyle.Render(strings.ToUpper(s.Slug)) + "\n\n")
-	}
-	b.WriteString(labelStyle.Render("TYPE        ") + boldStyle.Render(m.commitType) + "\n\n")
-	b.WriteString(labelStyle.Render("DESCRIPTION") + "\n")
-	b.WriteString(m.nameInput.View() + "\n")
-	if m.inputErr != "" {
-		b.WriteString("\n" + errStyle.Render(m.inputErr) + "\n")
-	}
-	// live preview of the final commit message
-	desc := m.nameInput.Value()
-	if desc == "" {
-		desc = dimStyle.Render("…")
-	}
-	b.WriteString("\n" + dimStyle.Render("→ "+m.commitType+": ") + desc)
 
 	modal := modalStyle.Render(b.String())
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal,
