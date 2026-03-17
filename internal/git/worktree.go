@@ -90,7 +90,7 @@ func parseBlock(block string) *model.Session {
 // DeleteWorktree removes the worktree at path and attempts to delete the branch.
 // The repoRoot is used as the working directory for git commands.
 func DeleteWorktree(repoRoot, path, branch string) error {
-	cmd := exec.Command("git", "worktree", "remove", path)
+	cmd := exec.Command("git", "worktree", "remove", "--force", path)
 	cmd.Dir = repoRoot
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
