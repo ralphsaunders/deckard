@@ -132,7 +132,6 @@ Navigation:
 * ↑ ↓ → select session
 * Enter/Space → resume session
 * `o` → open MR
-* `r` → refresh
 * `?` → filter
 
 ---

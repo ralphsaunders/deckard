@@ -1002,7 +1002,7 @@ func (m Model) renderHelp() string {
 	case stateReview:
 		text = "Enter attach · o open MR · s encode skill · Esc back"
 	default:
-		text = "↑/↓ navigate   Enter attach   n new   c commit   o open MR   d delete   r refresh   q quit"
+		text = "↑/↓ navigate   Enter attach   n new   c commit   o open MR   d delete   q quit"
 	}
 	sep := dimStyle.Render(strings.Repeat("─", m.width))
 	return sep + "\n" + helpStyle.Render(text)
