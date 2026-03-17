@@ -2,8 +2,11 @@ package tui
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +19,7 @@ import (
 	"deckard/internal/git"
 	"deckard/internal/gitlab"
 	"deckard/internal/model"
+	"deckard/internal/status"
 	"deckard/internal/tmux"
 )
 
@@ -29,6 +33,7 @@ const (
 	stateCommitType
 	stateCommit
 	stateDeleteConfirm
+	stateReview
 )
 
 // — conventional commit types ————————————————————————————————————————————————
@@ -142,6 +147,8 @@ type sessionItem struct {
 func (i sessionItem) Title() string {
 	var indicator string
 	switch {
+	case i.s.InputReason == model.InputReasonBlocked:
+		indicator = "✕"
 	case i.s.NeedsInput:
 		indicator = "▲"
 	case i.s.TmuxRunning:
@@ -212,32 +219,73 @@ func New() Model {
 
 // — commands ————————————————————————————————————————————————————————————————
 
-func fetchSessions() tea.Msg {
-	sessions, err := git.ListWorktrees()
-	if err != nil {
-		return sessionsLoadedMsg{sessions: nil, err: err}
-	}
+func fetchSessionsCmd(repoRoot string) tea.Cmd {
+	return func() tea.Msg {
+		sessions, err := git.ListWorktrees()
+		if err != nil {
+			return sessionsLoadedMsg{sessions: nil, err: err}
+		}
 
-	// Enrich sessions concurrently: tmux status + GitLab MR data.
-	var wg sync.WaitGroup
-	for i := range sessions {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			sessions[i].TmuxRunning = tmux.SessionExists(sessions[i].Slug)
-			if sessions[i].TmuxRunning {
-				sessions[i].NeedsInput = tmux.NeedsInput(sessions[i].Slug)
-			}
-			mr, _ := gitlab.FetchMR(sessions[i].Branch)
-			sessions[i].MR = mr
-			if mr != nil {
-				sessions[i].NeedsInput = mr.PipelineStatus == "failed" || mr.HasUnresolved
-			}
-		}(i)
-	}
-	wg.Wait()
+		// Enrich sessions concurrently: tmux status, GitLab MR data, agent status.
+		var wg sync.WaitGroup
+		for i := range sessions {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				sessions[i].TmuxRunning = tmux.SessionExists(sessions[i].Slug)
+				if sessions[i].TmuxRunning {
+					sessions[i].NeedsInput = tmux.NeedsInput(sessions[i].Slug)
+				}
+				mr, _ := gitlab.FetchMR(sessions[i].Branch)
+				sessions[i].MR = mr
+				agentStatus, _ := status.Read(repoRoot, sessions[i].Slug)
+				sessions[i].AgentStatus = agentStatus
+				sessions[i].NeedsInput, sessions[i].InputReason = computeNeedsInput(sessions[i])
+			}(i)
+		}
+		wg.Wait()
 
-	return sessionsLoadedMsg{sessions: sessions, err: nil}
+		return sessionsLoadedMsg{sessions: sessions, err: nil}
+	}
+}
+
+// computeNeedsInput determines whether a session needs human input, preferring
+// the explicit agent status file over inferred signals.
+func computeNeedsInput(s model.Session) (bool, model.InputReason) {
+	if s.AgentStatus != nil {
+		switch s.AgentStatus.Status {
+		case "needs_review":
+			return true, model.InputReasonReviewReady
+		case "blocked":
+			return true, model.InputReasonBlocked
+		}
+		return false, model.InputReasonNone
+	}
+	// fallback: infer from MR signals and tmux idle detection
+	if s.MR != nil && (s.MR.PipelineStatus == "failed" || s.MR.HasUnresolved) {
+		return true, model.InputReasonInferred
+	}
+	if s.NeedsInput {
+		return true, model.InputReasonInferred
+	}
+	return false, model.InputReasonNone
+}
+
+// sessionSortKey returns a sort priority: blocked first, then review-ready,
+// then inferred/active, then idle.
+func sessionSortKey(s model.Session) int {
+	switch s.InputReason {
+	case model.InputReasonBlocked:
+		return 0
+	case model.InputReasonReviewReady:
+		return 1
+	case model.InputReasonInferred:
+		return 2
+	}
+	if s.TmuxRunning {
+		return 3
+	}
+	return 4
 }
 
 func createWorktreeCmd(repoRoot, branch string) tea.Cmd {
@@ -257,6 +305,32 @@ func ensureAndAttachCmd(s model.Session) tea.Cmd {
 			return sessionEnsuredMsg{err: err}
 		}
 		return sessionEnsuredMsg{slug: s.Slug}
+	}
+}
+
+// encodeSkillCmd writes a skill-draft.md into the session's state dir,
+// then opens the main worktree's Claude session for skill encoding.
+func encodeSkillCmd(repoRoot string, s model.Session) tea.Cmd {
+	return func() tea.Msg {
+		dir := filepath.Join(repoRoot, ".claude", "sessions", s.Slug)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return sessionEnsuredMsg{err: err}
+		}
+		var draft strings.Builder
+		draft.WriteString("# Skill Draft: " + s.Slug + "\n\n")
+		if s.AgentStatus != nil && s.AgentStatus.Summary != "" {
+			draft.WriteString("## Summary\n\n" + s.AgentStatus.Summary + "\n\n")
+		}
+		draft.WriteString("## Task\n\nPlease encode the above work into a reusable skill.\n")
+		draftPath := filepath.Join(dir, "skill-draft.md")
+		if err := os.WriteFile(draftPath, []byte(draft.String()), 0644); err != nil {
+			return sessionEnsuredMsg{err: err}
+		}
+		// Ensure and attach to the main worktree session
+		if err := tmux.EnsureSession("main", repoRoot); err != nil {
+			return sessionEnsuredMsg{err: err}
+		}
+		return sessionEnsuredMsg{slug: "main"}
 	}
 }
 
@@ -312,7 +386,7 @@ func deleteWorktreeCmd(repoRoot, path, branch string) tea.Cmd {
 // — tea.Model ———————————————————————————————————————————————————————————————
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(fetchSessions, tickCmd())
+	return tea.Batch(fetchSessionsCmd(m.repoRoot), tickCmd())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -339,6 +413,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.err = nil
 		m.sessions = msg.sessions
+		sort.Slice(m.sessions, func(i, j int) bool {
+			return sessionSortKey(m.sessions[i]) < sessionSortKey(m.sessions[j])
+		})
 		m.buildItems()
 		return m, nil
 
@@ -364,8 +441,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case claudeExitedMsg:
 		// Claude exited — refresh the session list and return to the overview.
+		m.state = stateNormal
 		m.loading = true
-		return m, fetchSessions
+		return m, fetchSessionsCmd(m.repoRoot)
 
 	case commitResultMsg:
 		if msg.err != nil {
@@ -377,7 +455,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.nameInput.Reset()
 		m.nameInput.Blur()
 		m.loading = true
-		return m, fetchSessions
+		return m, fetchSessionsCmd(m.repoRoot)
 
 	case worktreeRemovedMsg:
 		if msg.err != nil {
@@ -388,7 +466,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = stateNormal
 		m.inputErr = ""
 		m.loading = true
-		return m, fetchSessions
+		return m, fetchSessionsCmd(m.repoRoot)
 	}
 
 	switch m.state {
@@ -400,6 +478,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateCommit(msg)
 	case stateDeleteConfirm:
 		return m.updateDeleteConfirm(msg)
+	case stateReview:
+		return m.updateReview(msg)
 	default:
 		return m.updateNormal(msg)
 	}
@@ -413,7 +493,7 @@ func (m Model) updateNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "r":
 			m.loading = true
-			return m, fetchSessions
+			return m, fetchSessionsCmd(m.repoRoot)
 		case "n":
 			m.state = stateNewSession
 			m.inputErr = ""
@@ -447,6 +527,10 @@ func (m Model) updateNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			s := m.selectedSession()
 			if s != nil {
+				if s.AgentStatus != nil {
+					m.state = stateReview
+					return m, nil
+				}
 				return m, ensureAndAttachCmd(*s)
 			}
 			return m, nil
@@ -455,6 +539,36 @@ func (m Model) updateNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.list, cmd = m.list.Update(msg)
 	return m, cmd
+}
+
+func (m Model) updateReview(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "esc":
+			m.state = stateNormal
+			return m, nil
+		case "enter":
+			s := m.selectedSession()
+			if s != nil {
+				return m, ensureAndAttachCmd(*s)
+			}
+			return m, nil
+		case "o":
+			s := m.selectedSession()
+			if s != nil && s.MR != nil && s.MR.WebURL != "" {
+				return m, openURLCmd(s.MR.WebURL)
+			}
+			return m, nil
+		case "s":
+			s := m.selectedSession()
+			if s != nil {
+				return m, encodeSkillCmd(m.repoRoot, *s)
+			}
+			return m, nil
+		}
+	}
+	return m, nil
 }
 
 func (m Model) updateNewSession(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -574,6 +688,11 @@ func (m Model) View() string {
 		)
 	}
 
+	// Full-screen states bypass the normal list/detail layout
+	if m.state == stateReview {
+		return m.renderReview()
+	}
+
 	body := lipgloss.JoinHorizontal(lipgloss.Top, m.list.View(), m.renderDetail())
 	base := lipgloss.JoinVertical(lipgloss.Left, body, m.renderHelp())
 
@@ -622,13 +741,19 @@ func (m Model) renderDetail() string {
 	}
 
 	var statusVal string
-	switch {
-	case s.NeedsInput:
-		statusVal = warnStyle.Render("▲ INPUT REQ")
-	case s.TmuxRunning:
-		statusVal = okStyle.Render("◆ ACTIVE")
+	switch s.InputReason {
+	case model.InputReasonReviewReady:
+		statusVal = okStyle.Render("▲ READY FOR REVIEW")
+	case model.InputReasonBlocked:
+		statusVal = errStyle.Render("✕ BLOCKED")
 	default:
-		statusVal = dimStyle.Render("· IDLE")
+		if s.NeedsInput {
+			statusVal = warnStyle.Render("▲ INPUT REQ")
+		} else if s.TmuxRunning {
+			statusVal = okStyle.Render("◆ ACTIVE")
+		} else {
+			statusVal = dimStyle.Render("· IDLE")
+		}
 	}
 
 	var b strings.Builder
@@ -645,12 +770,79 @@ func (m Model) renderDetail() string {
 		b.WriteString(dimStyle.Render("NO MR FOUND") + "\n")
 	}
 
+	if s.AgentStatus != nil {
+		b.WriteString("\n")
+		b.WriteString(sectionSep("AGENT", contentWidth) + "\n\n")
+		b.WriteString(renderAgentStatus(s.AgentStatus, contentWidth))
+	}
+
 	b.WriteString("\n")
 	if s.TmuxRunning {
 		b.WriteString(dimStyle.Render("CTRL+]  DETACH WITHOUT STOPPING CLAUDE\n"))
 	}
 
 	return style.Render(b.String())
+}
+
+func (m Model) renderReview() string {
+	s := m.selectedSession()
+	if s == nil || s.AgentStatus == nil {
+		// Fall back to normal layout
+		body := lipgloss.JoinHorizontal(lipgloss.Top, m.list.View(), m.renderDetail())
+		return lipgloss.JoinVertical(lipgloss.Left, body, m.renderHelp())
+	}
+
+	as := s.AgentStatus
+	contentWidth := m.width - 8 // 4 padding each side
+
+	var b strings.Builder
+	b.WriteString(detailHeadStyle.Render("REVIEW: "+strings.ToUpper(s.Slug)) + "\n")
+	b.WriteString(dimStyle.Render(strings.Repeat("─", contentWidth)) + "\n\n")
+
+	// SUMMARY
+	b.WriteString(detailHeadStyle.Render("SUMMARY") + "\n")
+	if as.Summary != "" {
+		for _, line := range strings.Split(wrapText(as.Summary, contentWidth-2), "\n") {
+			b.WriteString("  " + line + "\n")
+		}
+	}
+	b.WriteString("\n")
+
+	// UNCERTAINTY (omit if empty)
+	if len(as.Uncertainty) > 0 {
+		b.WriteString(detailHeadStyle.Render("UNCERTAINTY") + "\n")
+		for _, q := range as.Uncertainty {
+			b.WriteString("  · " + q + "\n")
+		}
+		b.WriteString("\n")
+	}
+
+	// BLOCKERS (omit if empty)
+	if len(as.Blockers) > 0 {
+		b.WriteString(detailHeadStyle.Render("BLOCKERS") + "\n")
+		for _, bl := range as.Blockers {
+			b.WriteString("  · " + bl + "\n")
+		}
+		b.WriteString("\n")
+	}
+
+	// MR section
+	b.WriteString(sectionSep("MR", contentWidth) + "\n\n")
+	if s.MR != nil {
+		b.WriteString(renderMR(s.MR, contentWidth))
+		if s.MR.Description != "" {
+			b.WriteString("\n")
+			b.WriteString(sectionSep("DESCRIPTION", contentWidth) + "\n\n")
+			for _, line := range strings.Split(wrapText(s.MR.Description, contentWidth-2), "\n") {
+				b.WriteString("  " + line + "\n")
+			}
+		}
+	} else {
+		b.WriteString(dimStyle.Render("  NO MR FOUND") + "\n")
+	}
+
+	body := lipgloss.NewStyle().Padding(1, 4).Width(m.width).Render(b.String())
+	return lipgloss.JoinVertical(lipgloss.Left, body, m.renderHelp())
 }
 
 // sectionSep renders a labeled divider: "─── LABEL ──────────────"
@@ -709,8 +901,74 @@ func renderMR(mr *model.MR, contentWidth int) string {
 	return b.String()
 }
 
-func pipelineLabel(status string) string {
-	switch status {
+func renderAgentStatus(as *model.AgentStatus, contentWidth int) string {
+	var b strings.Builder
+
+	if as.Summary != "" {
+		b.WriteString(labelStyle.Render("SUMMARY  "))
+		lines := strings.Split(wrapText(as.Summary, contentWidth-9), "\n")
+		b.WriteString(lines[0] + "\n")
+		for _, line := range lines[1:] {
+			b.WriteString(strings.Repeat(" ", 9) + line + "\n")
+		}
+		b.WriteString("\n")
+	}
+
+	if len(as.Uncertainty) > 0 {
+		b.WriteString(labelStyle.Render("UNCERTAIN") + "\n")
+		for _, q := range as.Uncertainty {
+			b.WriteString("           · " + q + "\n")
+		}
+		b.WriteString("\n")
+	}
+
+	if len(as.Blockers) > 0 {
+		b.WriteString(labelStyle.Render("BLOCKED  ") + "\n")
+		for _, bl := range as.Blockers {
+			b.WriteString("           · " + bl + "\n")
+		}
+		b.WriteString("\n")
+	}
+
+	return b.String()
+}
+
+// wrapText wraps text to the given width, breaking at word boundaries.
+func wrapText(text string, width int) string {
+	if width <= 0 {
+		return text
+	}
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return text
+	}
+	var lines []string
+	var current strings.Builder
+	currentLen := 0
+	for _, word := range words {
+		wLen := len([]rune(word))
+		if currentLen == 0 {
+			current.WriteString(word)
+			currentLen = wLen
+		} else if currentLen+1+wLen <= width {
+			current.WriteString(" ")
+			current.WriteString(word)
+			currentLen += 1 + wLen
+		} else {
+			lines = append(lines, current.String())
+			current.Reset()
+			current.WriteString(word)
+			currentLen = wLen
+		}
+	}
+	if current.Len() > 0 {
+		lines = append(lines, current.String())
+	}
+	return strings.Join(lines, "\n")
+}
+
+func pipelineLabel(ps string) string {
+	switch ps {
 	case "success":
 		return okStyle.Render("◆ PASSED")
 	case "failed":
@@ -726,7 +984,7 @@ func pipelineLabel(status string) string {
 	case "":
 		return dimStyle.Render("─")
 	default:
-		return dimStyle.Render(status)
+		return dimStyle.Render(ps)
 	}
 }
 
@@ -741,6 +999,8 @@ func (m Model) renderHelp() string {
 		text = "Enter commit   Esc ← type"
 	case stateDeleteConfirm:
 		text = "y/Enter confirm   n/Esc cancel"
+	case stateReview:
+		text = "Enter attach · o open MR · s encode skill · Esc back"
 	default:
 		text = "↑/↓ navigate   Enter attach   n new   c commit   o open MR   d delete   r refresh   q quit"
 	}
